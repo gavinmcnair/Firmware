@@ -705,10 +705,23 @@ same reason it's gated off for partial transfers: it's driven by
 `directWriteBytesWritten`, which a slot-target transfer never touches.
 Completion is END-only.
 
-### 10.6 On-device switching — no BLE opcode
+### 10.6 On-device switching
 
-There is **no BLE command to request a slot switch.** Slot contents reach the
-panel only through a local, non-BLE path: `odDisplaySwitchToSlot(slot_index)`
+> **Update:** as of `CMD_SLOT_SWITCH` (`0x0084`, see full doc block in
+> [`include/opendisplay_protocol.h`](../include/opendisplay_protocol.h)),
+> there **is** now a BLE command to request a slot switch — the server-driven
+> equivalent of a button press, for scheduled or event-driven page changes
+> (e.g. [`gavinmcnair/opendisplay-pages`](https://github.com/gavinmcnair/opendisplay-pages)'s
+> scheduler). Request: `[0x00][0x84][slot_id:1]`. Response: `[0x00][0x84]` on
+> success, `[0xFF][0x84][err][0x00]` on failure (`0x01` bad length, `0x02`
+> switch failed — collapses every underlying cause, see the header doc block).
+> Also **LOCAL FORK DIVERGENCE**, not upstream. Everything below this note was
+> written before `CMD_SLOT_SWITCH` existed and still describes the *local,
+> non-BLE* path it's built on: it hasn't changed, `CMD_SLOT_SWITCH` just adds
+> a BLE front door onto the same `odDisplayJumpToSlot()`.
+
+Slot contents also still reach the panel through the original local, non-BLE
+path: `odDisplaySwitchToSlot(slot_index)`
 ([display_service.cpp:2618-2699](../src/display_service.cpp)), which:
 
 1. Refuses if `slot_index` is out of range, that slot's `valid` flag is unset,

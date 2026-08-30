@@ -684,6 +684,7 @@ static const char* commandName(uint16_t cmd) {
         case CMD_PIPE_WRITE_START:    return "PIPE WRITE START";    // 0x0080
         case CMD_PIPE_WRITE_DATA:     return "PIPE WRITE DATA";     // 0x0081
         case CMD_PIPE_WRITE_END:      return "PIPE WRITE END";      // 0x0082
+        case CMD_SLOT_SWITCH:         return "SLOT SWITCH";         // 0x0084
         default:                      return nullptr;
     }
 }
@@ -908,6 +909,9 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             break;
         case CMD_PIPE_WRITE_END:      // 0x0082
             handlePipeWriteEnd(data + 2, len - 2);
+            break;
+        case CMD_SLOT_SWITCH:         // 0x0084 (LOCAL FORK DIVERGENCE, not upstream)
+            handleSlotSwitch(data + 2, len - 2);
             break;
         default:
             od_log_error("ERROR: Unknown command: 0x%04X", command);

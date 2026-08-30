@@ -73,11 +73,18 @@ bool odDisplaySwitchToSlot(uint8_t slot_index);
 // non-zero slots are populated or slot storage is disabled on this board.
 bool odDisplayCycleSlot(int8_t direction);
 
-// Jumps directly to slot_index (currently used only for KEY3 -> slot 0, the
-// reserved index/home page). Unlike odDisplayCycleSlot, this doesn't search
-// for a populated slot -- it fails cleanly (false, no-op) if slot_index isn't
-// valid, same as odDisplaySwitchToSlot.
+// Jumps directly to slot_index (used for KEY3 -> slot 0, the reserved
+// index/home page, and now the CMD_SLOT_SWITCH BLE handler below). Unlike
+// odDisplayCycleSlot, this doesn't search for a populated slot -- it fails
+// cleanly (false, no-op) if slot_index isn't valid, same as
+// odDisplaySwitchToSlot.
 bool odDisplayJumpToSlot(uint8_t slot_index);
+
+// CMD_SLOT_SWITCH (0x0084) handler -- LOCAL FORK DIVERGENCE, not upstream
+// (see opendisplay_protocol.h). The server-side equivalent of a button press:
+// switches the panel to data[0] (slot_id) via odDisplayJumpToSlot() and ACKs
+// or NACKs accordingly. See the opcode's doc block for the exact wire format.
+void handleSlotSwitch(uint8_t* data, uint16_t len);
 
 // Reserve the PIPE reorder queue (33 x 252 B on S3) in PSRAM. No-op unless the
 // target has both a WiFi surface and PSRAM; idempotent; never freed. Call from

@@ -2741,6 +2741,29 @@ bool odDisplayCycleSlot(int8_t) { return false; }
 bool odDisplayJumpToSlot(uint8_t) { return false; }
 #endif
 
+// CMD_SLOT_SWITCH (0x0084) -- LOCAL FORK DIVERGENCE, not upstream (see
+// opendisplay_protocol.h). Thin BLE wrapper around odDisplayJumpToSlot(): the
+// server-driven equivalent of a KEY3-style button press. odDisplayJumpToSlot
+// already covers every failure mode (out of range, unpopulated, slot storage
+// disabled, transfer active, refresh timeout) with a single bool, so this
+// handler collapses them to one NACK code -- see the opcode's doc block for
+// why a client shouldn't try to infer a specific cause from it.
+void handleSlotSwitch(uint8_t* data, uint16_t len) {
+    if (len < 1) {
+        uint8_t nack[] = {RESP_NACK, (uint8_t)(CMD_SLOT_SWITCH & 0xFF), OD_ERR_SLOT_SWITCH_BAD_LENGTH, 0x00};
+        sendResponse(nack, sizeof(nack));
+        return;
+    }
+    uint8_t slot_id = data[0];
+    if (!odDisplayJumpToSlot(slot_id)) {
+        uint8_t nack[] = {RESP_NACK, (uint8_t)(CMD_SLOT_SWITCH & 0xFF), OD_ERR_SLOT_SWITCH_FAILED, 0x00};
+        sendResponse(nack, sizeof(nack));
+        return;
+    }
+    uint8_t ack[] = {RESP_ACK, (uint8_t)(CMD_SLOT_SWITCH & 0xFF)};
+    sendResponse(ack, sizeof(ack));
+}
+
 // ===========================================================================
 // PIPE_WRITE (0x0080-0x0082): sliding-window image transfer with QUIC-style SACK.
 // Reuses the direct-write session machinery (directWriteComputeGeometry /

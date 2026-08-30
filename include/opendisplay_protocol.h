@@ -10,7 +10,7 @@
  *   fully-correct client from THIS FILE ALONE, without reading firmware.
  *
  *   OD_PROTOCOL_VERSION 2.2   (MAJOR.MINOR; see VERSIONING POLICY below)
- *   LAST CHANGED        2026-07-22
+ *   LAST CHANGED        2026-08-30
  *
  * --------------------------------------------------------------------------
  * VERSIONING POLICY
@@ -85,6 +85,14 @@
  *       SLOT_TOO_LARGE). CMD_PIPE_WRITE_END on a slot-target transfer does not
  *       refresh the panel -- see the CMD_PIPE_WRITE_START doc block. Additive,
  *       backward-compatible: old peers never set bit2 and are unaffected.
+ *     - MINOR: new CMD_SLOT_SWITCH (0x0084) -- LOCAL FORK DIVERGENCE, not
+ *       upstream. [slot_id:1] request; switches the panel to that PSRAM slot
+ *       immediately, server-driven -- the BLE equivalent of a local button
+ *       press (odDisplayJumpToSlot()). Until now there was NO way to change
+ *       which slot is on screen over BLE; a slot-target CMD_PIPE_WRITE_END
+ *       only auto-refreshes when it happens to target the slot already
+ *       selected. Adds the OD_ERR_SLOT_SWITCH_* namespace (SECTION 4e).
+ *       Additive: old peers never send 0x0084 and are unaffected.
  *     - Add each further wire-spec change here as it lands. On the next version
  *       bump, move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -649,8 +657,8 @@
  *            the one currently selected on the panel, END also triggers an
  *            on-device (non-BLE) refresh right after ACKing, with no BLE
  *            traffic of its own; writing to any other slot stays silent on
- *            the panel until a later button press selects it. There is no
- *            BLE opcode to request a slot switch directly.
+ *            the panel until a later button press, or CMD_SLOT_SWITCH
+ *            (0x0084, below), selects it.
  * @limits:   window/ack_every 1..32; frame <= PIPE_MAX_FRAME (244). slot_id
  *            0..99; a given board's OD_SLOT_COUNT may be smaller (PSRAM size
  *            varies by board) -- see OD_ERR_PIPE_START_SLOT_INVALID above.
@@ -731,6 +739,43 @@
  *            do not confuse the two.
  * -------------------------------------------------------------------------- */
 #define CMD_NFC_ENDPOINT               0x0083u
+
+/* --------------------------------------------------------------------------
+ * @opcode: 0x0084   @name: CMD_SLOT_SWITCH   @dir: host->device
+ * @request:  [0x00][0x84][slot_id:1]
+ *              slot_id = which PSRAM slot (see PIPE_FLAG_SLOT_TARGET on
+ *              CMD_PIPE_WRITE_START, SECTION 1) to display on the panel now.
+ * @response: [0x00][0x84]  (2 bytes: success, panel now shows slot_id)
+ * @errors:   [0xFF][0x84][OD_ERR_SLOT_SWITCH_*][0x00]  (4-byte NACK; namespace
+ *            scoped to 0x84, SECTION 4e):
+ *              0x01 OD_ERR_SLOT_SWITCH_BAD_LENGTH  (len < 1),
+ *              0x02 OD_ERR_SLOT_SWITCH_FAILED      (slot_id out of range or
+ *                unpopulated; slot storage unsupported/disabled on this
+ *                board; a BLE transfer is currently active; or the panel
+ *                refresh itself timed out -- odDisplayJumpToSlot() collapses
+ *                all of these into one bool, so this NACK alone does not
+ *                distinguish which. A client whose retry keeps failing should
+ *                fall back to CMD_PIPE_WRITE_START with PIPE_FLAG_SLOT_TARGET
+ *                against the same slot_id to confirm it is actually valid
+ *                and populated, rather than guessing from this code alone).
+ * @state:    invokes the SAME on-device switch a local button press triggers
+ *            (odDisplayJumpToSlot(), display_service.h) -- the server-driven
+ *            equivalent of a physical button press, for scheduled or
+ *            event-driven page changes. This is the ONLY way to change which
+ *            slot is on screen over BLE: CMD_PIPE_WRITE_END (SECTION 1,
+ *            0x0082) never does this by itself unless slot_id happens to
+ *            already be the slot currently selected (see that opcode's
+ *            @state for the one case where a push alone triggers a refresh).
+ *            Does not touch `displayed_etag` any differently than a normal
+ *            slot switch already does (cleared, same as every non-partial-
+ *            aware panel write) -- no new etag behavior of its own.
+ * @limits:   slot_id 0..99, same range as PIPE_FLAG_SLOT_TARGET's slot_id.
+ * @targets:  Firmware      (NOT NRF54, NOT Silabs, NOT NRF52811). Requires
+ *            that specific board to have PSRAM slot storage enabled
+ *            (OD_SLOT_COUNT > 0) -- LOCAL FORK DIVERGENCE, not upstream, see
+ *            CHANGELOG "Unreleased (since 2.2)" and PIPE_FLAG_SLOT_TARGET.
+ * -------------------------------------------------------------------------- */
+#define CMD_SLOT_SWITCH                 0x0084u
 
 /* ==========================================================================
  * SECTION 2 -- RESPONSE / STATUS BYTES (8-bit)
@@ -872,6 +917,14 @@
  *     NACK frame: [0xFF][0x52][err][0x00].
  * -------------------------------------------------------------------------- */
 #define OD_ERR_POWER_OFF_UNSUPPORTED   0x00u   /* no D-FF power latch on this target */
+
+/* --------------------------------------------------------------------------
+ * 4e. SLOT-SWITCH errors -- scope: CMD_SLOT_SWITCH (0x0084) ONLY.
+ *     NACK frame: [0xFF][0x84][err][0x00]. LOCAL FORK DIVERGENCE, not
+ *     upstream -- see CHANGELOG "Unreleased (since 2.2)".
+ * -------------------------------------------------------------------------- */
+#define OD_ERR_SLOT_SWITCH_BAD_LENGTH  0x01u   /* request shorter than 1 byte */
+#define OD_ERR_SLOT_SWITCH_FAILED      0x02u   /* out of range, unpopulated, unsupported, busy, or refresh timeout -- see CMD_SLOT_SWITCH @errors */
 
 /* ==========================================================================
  * SECTION 5 -- NFC SUB-PROTOCOL (rides CMD_NFC_ENDPOINT 0x0083)
