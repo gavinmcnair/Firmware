@@ -1,0 +1,91 @@
+---
+# OpenDisplay config for the Egham Departures board:
+# Seeed XIAO ESP32-S3 (8MB PSRAM) + Holitech HT075A04 7.5" 800x480 e-paper.
+# Pins confirmed from usetrmnl/trmnl-firmware's BOARD_XIAO_EPAPER_DISPLAY
+# (TRMNL_7inch5_OG_DIY_Kit env, src/DEV_Config.h) -- this exact panel has been
+# running that firmware all session, so these pins are proven working.
+# Panel IC type/color scheme use TRMNL's default (non-GEN2) profile, matching
+# what's already driving this physical unit successfully.
+
+system_config:
+  ic_type: 2                    # OD_IC_TYPE_ESP32S3
+  communication_modes: 1        # OD_COMM_MODE_BLE only -- WiFi bit deliberately unset
+  device_flags: 2                # OD_DEVICE_FLAG_XIAO_INIT (Seeed XIAO low-power init)
+  pwr_pin: 255                   # 0xFF = not present
+  pwr_pin_2: 255
+  pwr_pin_3: 255
+
+manufacturer_data:
+  manufacturer_id: 1            # OD_MANUFACTURER_SEEED
+  board_type: 0                 # not yet assigned in config.yaml catalog
+  board_revision: 0
+  simple_config_driver_index: 0
+  simple_config_display_index: 0
+  simple_config_power_index: 0
+  simple_config_configured_at: 0
+
+power_option:
+  power_mode: 1                  # OD_POWER_MODE_BATTERY
+  battery_capacity_mah: 0        # unknown for now
+  sleep_timeout_ms: 30000
+  tx_power: 0                    # platform default
+  sleep_flags: 0
+  battery_sense_pin: 1           # matches TRMNL's PIN_BATTERY for this board
+  battery_sense_enable_pin: 6    # matches TRMNL's PIN_VBAT_SWITCH (load-switch enable)
+  battery_sense_flags: 0         # VBAT_SWITCH_LEVEL was HIGH (non-inverted) on TRMNL's config
+  capacity_estimator: 5          # OD_CAPACITY_EST_SEEED_LI_ION (Seeed XIAO discharge curve)
+  voltage_scaling_factor: 0
+  deep_sleep_current_ua: 0
+  deep_sleep_time_seconds: 0     # disabled while actively testing
+  charge_enable_pin: 255
+  charge_state_pin: 255
+  charger_flags: 0
+  min_wake_time_seconds: 120
+  screen_timeout_seconds: 5
+
+displays:
+  - instance_number: 0
+    display_technology: 1        # OD_DISPLAY_TECH_E_PAPER
+    panel_ic_type: 21             # OD_PANEL_IC_EP75_800X480_4GRAY (GDEW075T7, older/default profile)
+    pixel_width: 800
+    pixel_height: 480
+    active_width_mm: 163          # standard for this panel family; cosmetic only
+    active_height_mm: 98
+    legacy_tag_type: 0
+    rotation: 0                   # OD_ROTATION_0
+    reset_pin: 38
+    busy_pin: 4
+    dc_pin: 10
+    cs_pin: 44
+    data_pin: 9                   # MOSI
+    partial_update_support: 0     # OD_PARTIAL_UPDATE_NONE -- confirmed: bb_epaper
+                                   # cannot do partial refresh in 4-gray mode on this panel
+    color_scheme: 5               # OD_COLOR_SCHEME_GRAY4 (2bpp 4-level gray)
+    transmission_modes: 27        # STREAMING_DECOMPRESSION | ZIP | DIRECT_WRITE | PIPE_WRITE
+    clk_pin: 7                    # SCK
+    cs_pin_2: 255                 # 0xFF = none (single-controller panel)
+    full_update_mC: 4000          # ~4s full refresh, estimate -- not load-bearing
+
+# PSRAM slot-storage button wiring (LOCAL FORK DIVERGENCE, see the Firmware
+# fork's docs/pipe-write-protocol.md §10) -- KEY1/KEY2/KEY3 GPIOs confirmed
+# empirically via a temporary GPIO-scan diagnostic against the real device,
+# not from any board datasheet. device_control.cpp's initButtons() returns
+# immediately (registers NO buttons at all) when this section is absent from
+# the device's stored config -- it is not optional, and it is NOT covered by
+# any compiled-in board default. If this ever needs re-sending (e.g. after a
+# LittleFS reformat wipes stored config -- has happened at least once), the
+# working values are:
+#   KEY1 = GPIO2 (button_id 0, PSRAM-slot cycle back)
+#   KEY2 = GPIO3 (button_id 1, PSRAM-slot cycle forward)
+#   KEY3 = GPIO5 (button_id 2, jump to slot 0 / index)
+# All three: active-low (idle HIGH, pressed LOW), internal pull-up enabled.
+# py-opendisplay JSON packet (id 37, "binary_input") equivalent -- this repo's
+# tooling speaks JSON, not this YAML, so translate by hand if reconstructing:
+#   instance_number=0, input_type=1 (BinaryInputType.DIGITAL), display_as=0,
+#   reserved_pin_1=2, reserved_pin_2=3, reserved_pin_3=5,
+#   reserved_pin_4..8=255 (unused),
+#   input_flags=7   (0b111 -- pins 1,2,3 of this instance are populated)
+#   invert=7        (0b111 -- all three read active-low)
+#   pullups=7       (0b111 -- internal pull-up on all three)
+#   pulldowns=0, button_data_byte_index=0, power_off_flags=0,
+#   power_off_hold_sec=0, reserved=0x0 (12 zero bytes)
