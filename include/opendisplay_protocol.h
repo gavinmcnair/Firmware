@@ -71,6 +71,20 @@
  *       silently dropped. Breaking only for peers that wrote >253 bytes in a
  *       single GATT write (none deployed -- HA's GATT client caps at 244 and
  *       rejects larger writes outright).
+ *     - LOCAL FORK DIVERGENCE (not from upstream opendisplay-protocol, not
+ *       synced -- see PIPE_FLAG_SLOT_TARGET below and its CMD_PIPE_WRITE_START
+ *       doc extension). Added directly in this Firmware clone because this
+ *       project isn't pursuing an upstream contribution for it. A future sync
+ *       from upstream opendisplay-protocol will need to reconcile this file
+ *       and opendisplay_structs.h by hand.
+ *     - MINOR: new PIPE_FLAG_SLOT_TARGET (flags bit2) on CMD_PIPE_WRITE_START --
+ *       writes the transfer into an on-device PSRAM "slot" instead of the
+ *       live panel. Mutually exclusive with PIPE_FLAG_PARTIAL (bit1). Adds a
+ *       6-byte PipeSlotExt trailing extension (see opendisplay_structs.h) and
+ *       two new OD_ERR_PIPE_START_* codes (0x04 SLOT_INVALID, 0x08
+ *       SLOT_TOO_LARGE). CMD_PIPE_WRITE_END on a slot-target transfer does not
+ *       refresh the panel -- see the CMD_PIPE_WRITE_START doc block. Additive,
+ *       backward-compatible: old peers never set bit2 and are unaffected.
  *     - Add each further wire-spec change here as it lands. On the next version
  *       bump, move these under a new "MAJOR.MINOR (YYYY-MM-DD)" heading.
  *
@@ -585,14 +599,28 @@
 
 /* --------------------------------------------------------------------------
  * @opcode: 0x0080   @name: CMD_PIPE_WRITE_START   @dir: host->device
- * @request:  10-byte header (22 when partial):
+ * @request:  10-byte header (22 when partial; 16 when slot-target):
  *              [0x00][0x80][ver:1][flags:1][req_window:1][req_ack_every:1]
  *                          [client_max_frame:2 LE][total_size:4 LE]
  *              --- appended iff flags bit1 (PIPE_FLAG_PARTIAL) ---
  *                          [old_etag:4 LE][x:2 LE][y:2 LE][w:2 LE][h:2 LE]
+ *              --- appended iff flags bit2 (PIPE_FLAG_SLOT_TARGET) ---
+ *                          [slot_id:1][reserved:1][decompressed_size:4 LE]
+ *                          (PipeSlotExt; decompressed_size is an optional
+ *                          parity-check hint for the switch-time tinfl
+ *                          decode -- 0 means skip the check -- NOT used to
+ *                          size anything during the write itself, which
+ *                          only ever stores the compressed bytes as-is)
  *              ver = PIPE_VERSION (1); flags bit0 = PIPE_FLAG_COMPRESSED (zlib),
- *              bit1 = PIPE_FLAG_PARTIAL. total_size = decompressed byte total
- *              (partial: plane_size * 2). All pipe fields are LITTLE-endian.
+ *              bit1 = PIPE_FLAG_PARTIAL, bit2 = PIPE_FLAG_SLOT_TARGET (LOCAL FORK
+ *              DIVERGENCE, not upstream -- see CHANGELOG). bit1 and bit2 are
+ *              mutually exclusive -- a request setting both is UNKNOWN_FLAG.
+ *              total_size = decompressed byte total (partial: plane_size * 2;
+ *              slot-target: compressed byte total actually being stored, since
+ *              slot storage is compressed-at-rest and must fit that slot's
+ *              fixed-size PSRAM region -- see OD_SLOT_SIZE_BYTES in Firmware's
+ *              structs.h; NOT a spec constant since it is per-board). All pipe
+ *              fields are LITTLE-endian.
  * @response: [0x00][0x80][ver:1][max_window:1][max_ack_every:1]
  *                        [max_frame:2 LE][resp_flags:1]
  *              resp_flags bit0 = selective-repeat supported, bit1 = partial
@@ -602,14 +630,30 @@
  *              0x01 OD_ERR_PIPE_START_BAD_HEADER   (bad length or version),
  *              0x02 OD_ERR_PIPE_START_UNKNOWN_FLAG,
  *              0x03 OD_ERR_PIPE_START_SIZE_MISMATCH,
+ *              0x04 OD_ERR_PIPE_START_SLOT_INVALID          (slot-target: slot_id
+ *                out of range for this board, or slot storage unsupported/
+ *                disabled here -- see OD_SLOT_COUNT),
  *              0x05 OD_ERR_PIPE_START_ETAG_MISMATCH        (partial),
  *              0x06 OD_ERR_PIPE_START_PARTIAL_UNSUPPORTED,
- *              0x07 OD_ERR_PIPE_START_RECT_INVALID          (partial).
- *            (0x04 unused.) See SECTION 4; do NOT emit OD_ERR_PARTIAL_* here --
- *            0x03/0x05/0x06/0x07 mean different things in the two namespaces.
- * @state:    a new START aborts any in-flight transfer; seq resets to 0.
- * @limits:   window/ack_every 1..32; frame <= PIPE_MAX_FRAME (244).
- * @targets:  Firmware      (NOT NRF54, NOT Silabs, NOT NRF52811)
+ *              0x07 OD_ERR_PIPE_START_RECT_INVALID          (partial),
+ *              0x08 OD_ERR_PIPE_START_SLOT_TOO_LARGE        (slot-target:
+ *                total_size exceeds this board's OD_SLOT_SIZE_BYTES).
+ *            See SECTION 4; do NOT emit OD_ERR_PARTIAL_* here -- 0x03/0x05/
+ *            0x06/0x07 mean different things in the two namespaces.
+ * @state:    a new START aborts any in-flight transfer; seq resets to 0. A
+ *            slot-target transfer never touches the panel controller: bytes
+ *            land only in the addressed PSRAM slot, and CMD_PIPE_WRITE_END
+ *            for it does NOT refresh the panel or wait for RESP_DIRECT_WRITE_
+ *            REFRESH_COMPLETE -- it ACKs as soon as the slot is fully written.
+ *            Slot contents are switched onto the panel only by a local
+ *            (non-BLE) button-triggered path -- there is no BLE opcode to
+ *            request a slot switch.
+ * @limits:   window/ack_every 1..32; frame <= PIPE_MAX_FRAME (244). slot_id
+ *            0..99; a given board's OD_SLOT_COUNT may be smaller (PSRAM size
+ *            varies by board) -- see OD_ERR_PIPE_START_SLOT_INVALID above.
+ * @targets:  Firmware      (NOT NRF54, NOT Silabs, NOT NRF52811). Slot-target
+ *            support additionally requires that specific board to have PSRAM
+ *            (OD_SLOT_COUNT > 0) -- LOCAL FORK DIVERGENCE, see CHANGELOG.
  * -------------------------------------------------------------------------- */
 #define CMD_PIPE_WRITE_START           0x0080u
 
@@ -792,16 +836,20 @@
  * 4b. PIPE-START errors -- scope: CMD_PIPE_WRITE_START (0x80) ONLY.
  *     NACK frame: [0xFF][0x80][err][0x00].  DISTINCT namespace from 4a: the
  *     shared byte values (0x03/0x05/0x06/0x07) mean different things here.
- *     (0x04 is unused in this set.)  Note: the in-flight 0x81 PIPE_WRITE_DATA
- *     NACK carries its OWN handler-local err byte (see CMD_PIPE_WRITE_DATA
- *     @response) and is not part of this START namespace.
+ *     Note: the in-flight 0x81 PIPE_WRITE_DATA NACK carries its OWN
+ *     handler-local err byte (see CMD_PIPE_WRITE_DATA @response) and is not
+ *     part of this START namespace.
+ *     0x04 and 0x08 (SLOT_INVALID / SLOT_TOO_LARGE) are LOCAL FORK
+ *     DIVERGENCE, not upstream -- see CHANGELOG "Unreleased (since 2.2)".
  * -------------------------------------------------------------------------- */
 #define OD_ERR_PIPE_START_BAD_HEADER          0x01u   /* bad length or version */
 #define OD_ERR_PIPE_START_UNKNOWN_FLAG        0x02u   /* unknown flags bit set */
 #define OD_ERR_PIPE_START_SIZE_MISMATCH       0x03u   /* total_size inconsistent */
+#define OD_ERR_PIPE_START_SLOT_INVALID        0x04u   /* slot-target: slot_id out of range, or slot storage unsupported here */
 #define OD_ERR_PIPE_START_ETAG_MISMATCH       0x05u   /* partial: old_etag mismatch */
 #define OD_ERR_PIPE_START_PARTIAL_UNSUPPORTED 0x06u   /* partial mode not supported */
 #define OD_ERR_PIPE_START_RECT_INVALID        0x07u   /* partial: invalid rectangle */
+#define OD_ERR_PIPE_START_SLOT_TOO_LARGE      0x08u   /* slot-target: total_size exceeds this board's OD_SLOT_SIZE_BYTES */
 
 /* --------------------------------------------------------------------------
  * 4c. DEEP-SLEEP errors -- scope: CMD_DEEP_SLEEP (0x0053) ONLY.
@@ -870,6 +918,7 @@
 #define PIPE_VERSION                   0x01u   /* carried in 0x80 request/response ver field */
 #define PIPE_FLAG_COMPRESSED           0x01u   /* flags bit0: streamed bytes are zlib-compressed */
 #define PIPE_FLAG_PARTIAL              0x02u   /* flags bit1: partial-region refresh */
+#define PIPE_FLAG_SLOT_TARGET          0x04u   /* flags bit2: write to a PSRAM slot, not the panel (LOCAL FORK DIVERGENCE, not upstream -- see CHANGELOG). Mutually exclusive with PIPE_FLAG_PARTIAL. */
 #define PIPE_MAX_FRAME                 244u    /* max on-wire frame size (GATT write ceiling) */
 #define PIPE_FRAME_OVERHEAD            3u      /* plaintext 0x81 header: cmd(2) + seq(1) */
 #define PIPE_ACK_MASK_BITS             32u     /* SACK ack_mask width in bits */

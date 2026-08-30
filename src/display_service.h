@@ -57,6 +57,28 @@ void handlePipeWriteData(uint8_t* data, uint16_t len);
 void handlePipeWriteEnd(uint8_t* data, uint16_t len);
 void resetPipeWriteState(void);
 
+// LOCAL FORK DIVERGENCE (PSRAM slot storage, not upstream -- see
+// opendisplay_protocol.h's PIPE_FLAG_SLOT_TARGET). Copies slot_index's stored
+// compressed bytes to the panel controller and refreshes -- no BLE traffic at
+// all, safe to call from a local button-press handler. Returns false (no-op)
+// if slot storage is disabled on this board, the index is out of range or
+// unwritten, or a BLE transfer is currently active (transferActive()).
+bool odDisplaySwitchToSlot(uint8_t slot_index);
+
+// Scans slots[] for the next (direction > 0) or previous (direction < 0)
+// populated (valid) slot from the current position, wrapping at OD_SLOT_COUNT,
+// skipping unpopulated slots, and switches to it. Slot 0 is never a landing
+// spot for this scan (valid or not) -- it's the reserved index/home page,
+// reachable only via odDisplayJumpToSlot. No-op (returns false) if zero
+// non-zero slots are populated or slot storage is disabled on this board.
+bool odDisplayCycleSlot(int8_t direction);
+
+// Jumps directly to slot_index (currently used only for KEY3 -> slot 0, the
+// reserved index/home page). Unlike odDisplayCycleSlot, this doesn't search
+// for a populated slot -- it fails cleanly (false, no-op) if slot_index isn't
+// valid, same as odDisplaySwitchToSlot.
+bool odDisplayJumpToSlot(uint8_t slot_index);
+
 // Reserve the PIPE reorder queue (33 x 252 B on S3) in PSRAM. No-op unless the
 // target has both a WiFi surface and PSRAM; idempotent; never freed. Call from
 // setup() before BLE accepts commands. A failure here is defective hardware and is

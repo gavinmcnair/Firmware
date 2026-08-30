@@ -54,6 +54,34 @@ struct ImageData {
 #endif
 #define PIPE_REORDER_SLOT_SIZE  248    // >= max plaintext data payload (241 @ frame 244; 212 encrypted)
 
+// PSRAM slot storage (LOCAL FORK DIVERGENCE -- see opendisplay_protocol.h's
+// PIPE_FLAG_SLOT_TARGET, not synced from upstream). Each board declares its
+// own PSRAM budget for slots via OD_SLOT_STORE_PSRAM_BUDGET_BYTES
+// (platformio.ini build_flags), sized to that board's actual headroom -- PSRAM
+// capacity varies by board (8MB on most PSRAM envs, 2MB on esp32-s3-N4R2) and
+// is fixed at compile time, so slot count is DERIVED per board
+// (budget / 32KB), not a single hardcoded number. Boards with no PSRAM at all
+// compile the feature out entirely (OD_SLOT_COUNT 0) -- there's nowhere to put
+// slots. 32KB/slot was chosen with real margin over measured compression
+// ratios (real content: 8-15KB; adversarial synthetic fractal: 24,338 bytes).
+//
+// Deliberately NOT gated on OPENDISPLAY_ENABLE_WIFI (unlike the tinfl-engine
+// selection in od_inflate_tinfl.h, which this pattern otherwise resembles):
+// slot storage only needs PSRAM, nothing to do with WiFi/LAN transport.
+// esp32-wrover-e-N4R8 has BOARD_HAS_PSRAM but deliberately no WiFi -- gating
+// on OPENDISPLAY_ENABLE_WIFI would silently disable slots on a real 8MB-PSRAM
+// board for an unrelated reason.
+#if defined(TARGET_ESP32) && defined(BOARD_HAS_PSRAM) && \
+    defined(OD_SLOT_STORE_PSRAM_BUDGET_BYTES)
+#define OD_SLOT_STORE_ENABLED  1
+#define OD_SLOT_SIZE_BYTES     (32u * 1024u)
+#define OD_SLOT_COUNT          (OD_SLOT_STORE_PSRAM_BUDGET_BYTES / OD_SLOT_SIZE_BYTES)
+#else
+#define OD_SLOT_STORE_ENABLED  0
+#define OD_SLOT_COUNT          0
+#define OD_SLOT_SIZE_BYTES     0
+#endif
+
 // LOCAL link policy: the ATT MTU this device asks the stack to negotiate on the
 // BLE transport. "Preferred" is literal -- the central drives the exchange and may
 // settle lower, so nothing may assume this value was granted. Deliberately
@@ -84,10 +112,17 @@ static_assert(OD_BLE_PREFERRED_ATT_MTU - 3u <= OD_BLE_MAX_FRAME,
 // definitions, so they do not belong in this hub.
 
 // PIPE_WRITE protocol constants (PIPE_ACK_MASK_BITS, PIPE_MAX_FRAME, PIPE_VERSION,
-// PIPE_FLAG_COMPRESSED, PIPE_FLAG_PARTIAL) come from the canonical opendisplay_protocol.h.
+// PIPE_FLAG_COMPRESSED, PIPE_FLAG_PARTIAL, PIPE_FLAG_SLOT_TARGET) come from the
+// canonical opendisplay_protocol.h (PIPE_FLAG_SLOT_TARGET is a LOCAL FORK
+// DIVERGENCE there, not synced from upstream).
 // PIPE_FLAG_PARTIAL bit1: partial-region refresh. START carries a 12-byte LE extension
 // [old_etag:4][x:2][y:2][w:2][h:2]; geometry/etag validated like 0x76, refresh
 // mode + new_etag ride the 0x0082 END. See PIPE_WRITE section in display_service.cpp.
+// PIPE_FLAG_SLOT_TARGET bit2 (mutually exclusive with bit1): writes into an
+// OD_SLOT_STORE_ENABLED PSRAM slot instead of the panel. START carries a
+// 6-byte LE PipeSlotExt [slot_id:1][reserved:1][decompressed_size:4]; END
+// never refreshes the panel for these transfers. See PIPE_WRITE section in
+// display_service.cpp and odDisplaySwitchToSlot().
 
 struct PipeReorderSlot {
     bool     occupied;
@@ -96,11 +131,28 @@ struct PipeReorderSlot {
     uint8_t  data[PIPE_REORDER_SLOT_SIZE];
 };
 
+// One PSRAM-backed slot (see OD_SLOT_STORE_ENABLED above). `data` points into
+// a single contiguous heap_caps_calloc'd block reserved once at boot
+// (odDisplayReserveBuffers), not a per-slot allocation. `length` is the
+// COMPRESSED byte count actually stored -- slots are compressed-at-rest,
+// decompressed only at switch time (odDisplaySwitchToSlot). `valid`
+// distinguishes "never written" / "write aborted" from "complete and
+// switchable"; it is cleared at the start of every write into this slot and
+// only set true once CMD_PIPE_WRITE_END confirms the transfer completed.
+struct SlotBuffer {
+    uint8_t* data;
+    uint16_t length;             // compressed bytes actually stored
+    uint32_t decompressed_size;  // from PipeSlotExt; 0 = no parity-check hint
+    bool     valid;
+};
+
 struct PipeWriteState {
     bool     active;
     bool     error;             // fatal: silently discard 0x0081 until next 0x0080 / disconnect
     bool     compressed;
     bool     partial;           // partial-region transfer: route DATA to partialCtx, END drives REFRESH_PARTIAL
+    bool     to_slot;           // slot-target transfer (PIPE_FLAG_SLOT_TARGET): route DATA into slots[target_slot], END never refreshes the panel. Mutually exclusive with `partial`.
+    uint8_t  target_slot;       // valid only when to_slot is set
     bool     gap_open;          // true while a hole is outstanding (queue non-empty)
     uint8_t  window;            // W_eff
     uint8_t  ack_every;         // N_eff
@@ -111,7 +163,7 @@ struct PipeWriteState {
     uint32_t received_count;    // accepted+queued distinct frames (diagnostics)
     uint8_t  frames_since_ack;  // cadence counter (in-order accepts)
     uint8_t  ooo_acks_since_gap;// rate-limit counter for out-of-order / duplicate gap ACKs
-    uint32_t total_size;        // negotiated decompressed panel byte total
+    uint32_t total_size;        // negotiated byte total: decompressed panel bytes normally, but the COMPRESSED byte total being stored when to_slot is set (must fit OD_SLOT_SIZE_BYTES)
     uint8_t  queued_count;      // reorder-queue occupancy
     uint8_t  queue_high_water;  // diagnostics: max occupancy seen this transfer
 };

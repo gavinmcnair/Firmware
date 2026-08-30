@@ -612,6 +612,17 @@ static PipeReorderSlot* pipeReorder = nullptr;
 static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
 #endif
 
+// PSRAM slot storage (LOCAL FORK DIVERGENCE -- see structs.h). `slots[]` itself
+// is just pointers/metadata (~12 B/entry, negligible even at 100 slots) and
+// always lives in ordinary static RAM; only the bytes each `.data` pointer
+// addresses come from one big PSRAM block reserved below, matching the
+// `pipeReorder` pattern above minus its internal-DRAM fallback (there is none
+// here: OD_SLOT_STORE_ENABLED is 0 on any board without PSRAM, so this array
+// is empty and reserveSlotBuffers() below is a no-op there).
+#if OD_SLOT_STORE_ENABLED
+static SlotBuffer slots[OD_SLOT_COUNT];
+#endif
+
 void odDisplayReserveBuffers(void) {
 #if OD_PIPE_REORDER_IN_PSRAM
     if (pipeReorder != nullptr) return;   // idempotent
@@ -633,6 +644,34 @@ void odDisplayReserveBuffers(void) {
     od_log_info("PIPE reorder queue: %u slots x %u B reserved in PSRAM, internal free=%u",
                 (unsigned)PIPE_REORDER_SLOTS, (unsigned)sizeof(PipeReorderSlot),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#endif
+
+#if OD_SLOT_STORE_ENABLED
+    {
+        static bool slotStoreReserved = false;
+        if (slotStoreReserved) return;   // idempotent, same as pipeReorder above
+        // One contiguous block, not OD_SLOT_COUNT separate allocations --
+        // cheaper on the allocator and matches the pipeReorder pattern. Each
+        // slots[i].data points OD_SLOT_SIZE_BYTES apart into it.
+        uint8_t* base = (uint8_t*)heap_caps_calloc(OD_SLOT_COUNT, OD_SLOT_SIZE_BYTES,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (base == nullptr) {
+            od_log_error("ERROR: slot store PSRAM reservation failed (%u x %u B) -- defective PSRAM?",
+                         (unsigned)OD_SLOT_COUNT, (unsigned)OD_SLOT_SIZE_BYTES);
+            return;
+        }
+        for (uint32_t i = 0; i < OD_SLOT_COUNT; ++i) {
+            slots[i].data = base + (size_t)i * OD_SLOT_SIZE_BYTES;
+            slots[i].length = 0;
+            slots[i].decompressed_size = 0;
+            slots[i].valid = false;
+        }
+        slotStoreReserved = true;
+        od_log_info("Slot store: %u slots x %u B (%u B total) reserved in PSRAM, internal free=%u",
+                    (unsigned)OD_SLOT_COUNT, (unsigned)OD_SLOT_SIZE_BYTES,
+                    (unsigned)OD_SLOT_COUNT * OD_SLOT_SIZE_BYTES,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 #endif
 }
 
@@ -712,7 +751,16 @@ void checkTransferTimeouts(void) {
     // cannot progress, so holding the loop awake for it burns power for work that
     // will never happen -- on nRF a delay(1) gate is below the tickless threshold
     // and spins rather than sleeping. Remove the state; do not idle on it.
-    if (pipeState.active && !pipeState.error && !directWriteActive && !partialCtx.active) {
+    //
+    // LOCAL FORK DIVERGENCE (PSRAM slot storage): a slot-target session
+    // (pipeState.to_slot) is a THIRD legitimate case with no hardware half at
+    // all, by design -- it writes only into PSRAM and never touches the panel
+    // (see handlePipeWriteStart's slot-target branch). It has no panel power
+    // or watchdog-worthy resource to leak if abandoned mid-transfer (unlike
+    // direct-write/partial), so it doesn't need its own timeout here either --
+    // a stuck one self-heals on the next 0x0080 START, which unconditionally
+    // resets pipeState regardless of session type.
+    if (pipeState.active && !pipeState.error && !directWriteActive && !partialCtx.active && !pipeState.to_slot) {
         od_log_error("ERROR: orphaned pipe session (no hardware half) - resetting");
         resetPipeWriteState();
     }
@@ -2554,6 +2602,145 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
 }
 
+// LOCAL FORK DIVERGENCE (PSRAM slot storage, not upstream -- see structs.h /
+// opendisplay_protocol.h PIPE_FLAG_SLOT_TARGET). Copies a stored slot's
+// compressed bytes to the panel controller and refreshes, with NO BLE traffic
+// at all -- this is the function a local button press drives. Deliberately
+// reuses directWriteComputeGeometry/directWriteActivatePanel/
+// zlib_stream_to_direct_write verbatim (the same proven decode+panel-write
+// path the BLE direct-write/PIPE_WRITE handlers use) rather than a parallel
+// reimplementation, since transferActive() below guarantees no live BLE
+// session is touching that state while we run. What is NOT reused is
+// directWriteFinishAndRefresh -- it unconditionally calls sendResponse() to
+// answer a BLE command, which would emit confusing unsolicited bytes to
+// whatever's connected; the refresh-trigger tail here is copied from it with
+// every sendResponse() call stripped, not reinvented.
+bool odDisplaySwitchToSlot(uint8_t slot_index) {
+#if OD_SLOT_STORE_ENABLED
+    if (slot_index >= OD_SLOT_COUNT || !slots[slot_index].valid) return false;
+    // Never race a live BLE transfer for the shared directWrite*/pipeState
+    // globals this reuses. A switch request arriving mid-transfer is simply
+    // dropped -- a button press racing an active push is a user-timing edge
+    // case, not a protocol guarantee.
+    if (transferActive()) return false;
+
+    struct SlotBuffer& s = slots[slot_index];
+
+    directWriteComputeGeometry(true);   // slots are always compressed at rest
+    // Cross-check the client's optional hint (if it supplied one) against the
+    // panel's real, firmware-computed frame size before touching hardware --
+    // cheap and catches a stale/wrong slot early. directWriteTotalBytes (just
+    // computed above) is the value that actually governs completion below,
+    // not this hint.
+    if (s.decompressed_size != 0 && s.decompressed_size != directWriteTotalBytes) {
+        od_log_error("ERROR: slot %u decompressed_size hint (%u) != panel frame size (%u), refusing switch",
+                     (unsigned)slot_index, (unsigned)s.decompressed_size, (unsigned)directWriteTotalBytes);
+        return false;
+    }
+    directWriteDecompressedTotal = directWriteTotalBytes;
+
+    touchSuspendForEpdRefresh();
+    directWriteTouchSuspended = true;
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_prepare_hardware();
+    }
+#endif
+    directWriteActivatePanel();   // epdSessionAcquire, bbepSetAddrWindow/StartWrite, od_zlib_stream_reset
+
+    // The whole compressed buffer is already resident in PSRAM -- one push
+    // with final=true, unlike the multi-call BLE-streaming case.
+    if (!zlib_stream_to_direct_write(s.data, s.length, true)) {
+        cleanupDirectWriteState(true);   // fatal teardown, same as a BLE decode failure
+        return false;
+    }
+
+    imageWriteLogFinish(directWriteBytesWritten, directWriteTotalBytes);
+
+    // Refresh-trigger tail, copied from directWriteFinishAndRefresh with every
+    // sendResponse() call removed -- see the function comment above.
+    odWatchdogFeed();   // reload before entering bb_epaper (may block ~240 s)
+    epdRefreshInProgress = true;
+    bool refreshSuccess = false;
+#if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
+    if (fastepd_driver_used()) {
+        fastepd_direct_refresh(REFRESH_FULL);
+        refreshSuccess = waitforrefresh(60);
+    } else
+#endif
+    {
+        if (splitPanelUsed() && !splitPanelCloseFrame()) {
+            refreshSuccess = false;
+        } else {
+            bbepRefresh(&bbep, REFRESH_FULL);
+            refreshSuccess = waitforrefresh(60);
+            splitPanelPowerOff();
+        }
+    }
+    endRefresh();
+    cleanupDirectWriteState(false);
+    requestAdvertisingRestart();
+
+    // A switch is never partial-aware -- clear displayed_etag so a later
+    // partial-region request gets a clean ETAG mismatch and falls back to
+    // full, matching the pattern every other non-partial-aware panel write
+    // in this file already follows.
+    displayed_etag = 0;
+
+    if (!refreshSuccess) {
+        od_log_error("ERROR: slot %u switch refresh timed out", (unsigned)slot_index);
+    }
+    return refreshSuccess;
+#else
+    (void)slot_index;
+    return false;
+#endif
+}
+
+// Current slot shown via odDisplayCycleSlot, file-static per this repo's "no
+// cross-file extern" convention (see CLAUDE.md) -- device_control.cpp reaches
+// this only through odDisplayCycleSlot(), never the variable directly.
+#if OD_SLOT_STORE_ENABLED
+static uint8_t currentSlotIndex = 0;
+
+bool odDisplayCycleSlot(int8_t direction) {
+    if (direction == 0) return false;
+    // Search using a local candidate only -- currentSlotIndex must track what
+    // is actually ON THE PANEL, so it's committed only once
+    // odDisplaySwitchToSlot() confirms success below, never speculatively
+    // during the search (a failed switch, e.g. a BLE transfer is active,
+    // must leave currentSlotIndex exactly as it was).
+    int32_t candidate = currentSlotIndex;
+    for (uint32_t step = 0; step < OD_SLOT_COUNT; ++step) {
+        // Signed arithmetic in an int32_t, then wrap into [0, OD_SLOT_COUNT)
+        // -- OD_SLOT_COUNT is small (<=100) so this never overflows.
+        candidate += (direction > 0 ? 1 : -1);
+        candidate = ((candidate % (int32_t)OD_SLOT_COUNT) + (int32_t)OD_SLOT_COUNT) % (int32_t)OD_SLOT_COUNT;
+        if (candidate == currentSlotIndex) break;   // full cycle, nothing else populated
+        // Slot 0 is the reserved index/home page (KEY3 jumps there directly,
+        // see odDisplayJumpToSlot) -- KEY1/KEY2 cycling never lands on it,
+        // valid or not, so it stays a distinct "home" rather than one more
+        // stop in the rotation.
+        if (candidate == 0) continue;
+        if (slots[candidate].valid) {
+            if (!odDisplaySwitchToSlot((uint8_t)candidate)) return false;
+            currentSlotIndex = (uint8_t)candidate;
+            return true;
+        }
+    }
+    return false;   // no other populated slot to switch to
+}
+
+bool odDisplayJumpToSlot(uint8_t slot_index) {
+    if (!odDisplaySwitchToSlot(slot_index)) return false;
+    currentSlotIndex = slot_index;
+    return true;
+}
+#else
+bool odDisplayCycleSlot(int8_t) { return false; }
+bool odDisplayJumpToSlot(uint8_t) { return false; }
+#endif
+
 // ===========================================================================
 // PIPE_WRITE (0x0080-0x0082): sliding-window image transfer with QUIC-style SACK.
 // Reuses the direct-write session machinery (directWriteComputeGeometry /
@@ -2739,6 +2926,25 @@ static void pipeUpdateHighestSeen(uint8_t seq) {
 static bool pipeConsumePayload(uint8_t* data, uint16_t len) {
     if (len == 0) return true;
     imageWriteLogChunk(data, len);
+    // Slot-target transfers store the compressed bytes as-is (no zlib/gray4
+    // handling on the write path at all -- decompression only happens later,
+    // at switch time, in odDisplaySwitchToSlot) -- a plain bounds-checked
+    // memcpy into this slot's PSRAM region, nothing else. Simpler than the
+    // partial/direct-write branches below because there's no panel state to
+    // drive here at all.
+    if (pipeState.to_slot) {
+#if OD_SLOT_STORE_ENABLED
+        struct SlotBuffer& s = slots[pipeState.target_slot];
+        uint32_t remaining = (s.length < pipeState.total_size) ? (pipeState.total_size - s.length) : 0;
+        uint16_t toWrite = (len > remaining) ? (uint16_t)remaining : len;
+        if (toWrite > 0) {
+            memcpy(s.data + s.length, data, toWrite);
+            s.length += toWrite;
+        }
+        imageWriteLogProgress(s.length, pipeState.total_size);
+#endif
+        return true;
+    }
     // Partial transfers stream into the two 1bpp controller planes via partialCtx;
     // partial_consume_bytes handles zlib-vs-raw and plane-at-a-time sub-window
     // addressing itself, so the full-frame directWrite* writers below are skipped.
@@ -2795,11 +3001,16 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     uint32_t total_size       = req.total_size;
 
     if (ver != PIPE_VERSION) { sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return; }
-    // Defined flags: bit0 zlib compression, bit1 partial-region refresh. Any other bit unsupported.
-    if ((flags & ~(PIPE_FLAG_COMPRESSED | PIPE_FLAG_PARTIAL)) != 0) { sendPipeStartNack(OD_ERR_PIPE_START_UNKNOWN_FLAG); return; }
+    // Defined flags: bit0 zlib compression, bit1 partial-region refresh, bit2
+    // slot-target (LOCAL FORK DIVERGENCE, not upstream -- see CHANGELOG). Any
+    // other bit unsupported.
+    if ((flags & ~(PIPE_FLAG_COMPRESSED | PIPE_FLAG_PARTIAL | PIPE_FLAG_SLOT_TARGET)) != 0) { sendPipeStartNack(OD_ERR_PIPE_START_UNKNOWN_FLAG); return; }
 
     bool compressed = (flags & PIPE_FLAG_COMPRESSED) != 0;
     bool partial    = (flags & PIPE_FLAG_PARTIAL) != 0;
+    bool slotTarget = (flags & PIPE_FLAG_SLOT_TARGET) != 0;
+    // Mutually exclusive: slot-target never needs partial-region semantics.
+    if (partial && slotTarget) { sendPipeStartNack(OD_ERR_PIPE_START_UNKNOWN_FLAG); return; }
 
     // Partial START appends a 12-byte LE extension after total_size (payload len 22 vs 10):
     // [old_etag:4][x:2][y:2][w:2][h:2]. LE, unlike 0x76's big-endian layout.
@@ -2842,9 +3053,26 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
         }
     }
 
+    // Slot-target START appends a 6-byte LE PipeSlotExt after total_size (payload
+    // len 16 vs 10): [slot_id:1][reserved:1][decompressed_size:4]. Pure config
+    // validation, no panel I/O -- this path never touches the panel at all.
+    uint8_t  slotId = 0;
+    uint32_t slotDecompressedSize = 0;
+    if (slotTarget) {
+        if (len < sizeof(struct PipeStartRequest) + sizeof(struct PipeSlotExt)) {
+            sendPipeStartNack(OD_ERR_PIPE_START_BAD_HEADER); return;
+        }
+        struct PipeSlotExt ext;
+        memcpy(&ext, data + sizeof(struct PipeStartRequest), sizeof ext);
+        slotId = ext.slot_id;
+        slotDecompressedSize = ext.decompressed_size;
+    }
+
     // total_size validation (plan 1.2, order 8). Pure config/geometry math (no panel I/O),
     // so a NACK here needs no teardown. Partial: plane_size*2 (flat old+new planes, like
-    // 0x76). Full: directWriteComputeGeometry's decompressed panel byte total.
+    // 0x76). Slot-target: total_size is the COMPRESSED byte total being stored, must fit
+    // this board's OD_SLOT_SIZE_BYTES (compile-time, per-board -- see structs.h). Full:
+    // directWriteComputeGeometry's decompressed panel byte total.
     if (partial) {
         planeBytes = calc_controller_plane_bytes(rectW, rectH);
         if (planeBytes == 0 || total_size != planeBytes * 2u) {
@@ -2852,6 +3080,11 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
             // (parity with send_direct_write_nack).
             displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_SIZE_MISMATCH); return;
         }
+    } else if (slotTarget) {
+        // slotId >= OD_SLOT_COUNT correctly NACKs every slot-target request on a
+        // board with no slot support at all (OD_SLOT_COUNT == 0 there).
+        if (slotId >= OD_SLOT_COUNT) { sendPipeStartNack(OD_ERR_PIPE_START_SLOT_INVALID); return; }
+        if (total_size == 0 || total_size > OD_SLOT_SIZE_BYTES) { sendPipeStartNack(OD_ERR_PIPE_START_SLOT_TOO_LARGE); return; }
     } else {
         directWriteComputeGeometry(compressed);
         if (total_size != directWriteTotalBytes) { sendPipeStartNack(OD_ERR_PIPE_START_SIZE_MISMATCH); return; }
@@ -2883,6 +3116,20 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     pipeState.queued_count = 0;
     pipeState.queue_high_water = 0;
     pipeState.partial = partial;
+    pipeState.to_slot = slotTarget;
+    pipeState.target_slot = slotId;
+
+    // Reset this slot's metadata up front so an aborted/failed transfer never
+    // leaves stale bytes marked valid -- mirrors the partial path clearing
+    // displayed_etag on every failure above. Only handlePipeWriteEnd sets
+    // valid=true, once the whole transfer is confirmed complete.
+#if OD_SLOT_STORE_ENABLED
+    if (slotTarget) {
+        slots[slotId].valid = false;
+        slots[slotId].length = 0;
+        slots[slotId].decompressed_size = slotDecompressedSize;
+    }
+#endif
 
     // Partial transfers own partialCtx (two 1bpp planes); init it exactly as the 0x76
     // START does, but new_etag stays 0 — it rides the 0x0082 END. Bookkeeping only; the
@@ -2922,6 +3169,17 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
                        (uint8_t)(PIPE_MAX_FRAME & 0xFF), (uint8_t)((PIPE_MAX_FRAME >> 8) & 0xFF),
                        (uint8_t)(0x01 | (partial ? PIPE_FLAG_PARTIAL : 0))};
     sendResponse(resp, sizeof(resp));
+
+    if (slotTarget) {
+        // This path never touches the panel controller at all: no touch-suspend,
+        // no directWriteActivatePanel, nothing. Bytes land only in PSRAM via
+        // pipeConsumePayload's to_slot branch; CMD_PIPE_WRITE_END marks the slot
+        // valid and ACKs -- no refresh, no wait. That's the whole point: finishing
+        // a slot upload never blocks on panel bring-up or a refresh cycle.
+        imageWriteLogReset();
+        imageWriteLogStart(total_size);
+        return;
+    }
 
     if (partial) {
         // Partial bring-up (0x76 parity): white-fill both controller planes and reset the
@@ -3059,6 +3317,49 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
     }
     // Tail-flush ACK precedes the END result (plan 1.3c / 1.5).
     sendPipeAck();
+
+    // Slot-target transfers: a completed write marks the slot valid and ACKs.
+    // No panel refresh UNLESS this slot happens to be the one currently on
+    // screen (target_slot == currentSlotIndex) -- pushing to any other slot
+    // stays silent until a button selects it. A button press is still the
+    // only way to CHANGE which slot is selected; this only keeps the
+    // already-selected one live rather than showing stale data while a fresh
+    // version sits in PSRAM unseen.
+    if (pipeState.to_slot) {
+#if OD_SLOT_STORE_ENABLED
+        struct SlotBuffer& s = slots[pipeState.target_slot];
+        bool incompleteSlot = (pipeState.queued_count > 0) || (s.length != pipeState.total_size);
+        if (incompleteSlot) {
+            uint8_t n[2] = {RESP_NACK, 0x82};
+            sendResponse(n, sizeof(n));
+            s.valid = false;
+            resetPipeWriteState();
+            return;
+        }
+        imageWriteLogFinish(s.length, pipeState.total_size);
+        s.valid = true;
+        uint8_t ackResponse[] = {RESP_ACK, 0x82};
+        sendResponse(ackResponse, sizeof(ackResponse));
+        // ACK goes out before the (potentially ~2s) refresh below, same
+        // reasoning as every other END handler in this file: don't make the
+        // client's tail-flush probe sit through a blocking panel refresh.
+        //
+        // reset BEFORE the switch attempt, not after: odDisplaySwitchToSlot()
+        // guards on transferActive(), which is still true while pipeState.active
+        // holds -- calling it first would make this transfer see itself as "a
+        // transfer in progress" and refuse to run. Capture target_slot first
+        // since reset zeroes it.
+        uint8_t targetSlot = pipeState.target_slot;
+        resetPipeWriteState();
+        if (targetSlot == currentSlotIndex) {
+            odDisplaySwitchToSlot(targetSlot);
+        }
+        return;
+#else
+        resetPipeWriteState();
+        return;
+#endif
+    }
 
     // Partial transfers never auto-complete (plan 1.5): the 0x0082 END alone carries the
     // refresh mode + new_etag. Completeness mirrors the 0x76 partial branch.

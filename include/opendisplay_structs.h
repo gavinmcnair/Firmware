@@ -67,6 +67,11 @@
  *            new version heading on each bump -- see AGENT INSTRUCTIONS below)
  * --------------------------------------------------------------------------
  *   Unreleased (since 2.0)
+ *     - LOCAL FORK DIVERGENCE (not from upstream opendisplay-protocol, not
+ *       synced): new struct PipeSlotExt, the slot-target twin of
+ *       PipePartialExt (see opendisplay_protocol.h's PIPE_FLAG_SLOT_TARGET).
+ *       Added directly in this Firmware clone; a future sync from upstream
+ *       will need to reconcile this file by hand.
  *     - Doc-only: fixed two comment shapes the codegen parser mis-read and added
  *       the CODEGEN AUTHORING RULES banner section to prevent recurrence. Split the
  *       combined BusFlags/PinBitmap @bits comment into one comment per group; folded
@@ -1148,6 +1153,22 @@ struct PipePartialExt {
     uint16_t h;        /**< @endian le @unit px @doc "region height." */
 } __attribute__((packed));
 OD_STATIC_ASSERT(sizeof(struct PipePartialExt) == 12, "PipePartialExt wire size");
+
+/** @struct PipeSlotExt  @message CMD_PIPE_WRITE_START  @endian le
+ *  @doc "6-byte slot-target extension appended to PipeStartRequest when
+ *  PIPE_FLAG_SLOT_TARGET is set (LOCAL FORK DIVERGENCE, not synced from
+ *  upstream opendisplay-protocol -- see opendisplay_protocol.h CHANGELOG).
+ *  Mutually exclusive with PipePartialExt (PIPE_FLAG_PARTIAL). Writes the
+ *  transfer into an on-device PSRAM slot instead of the live panel; the
+ *  base PipeStartRequest.total_size field carries the COMPRESSED byte total
+ *  being stored (must fit that board's OD_SLOT_SIZE_BYTES), not a
+ *  decompressed size." */
+struct PipeSlotExt {
+    uint8_t  slot_id;           /**< @min 0 @max 99 @doc "target slot index; NACKed OD_ERR_PIPE_START_SLOT_INVALID if >= this board's OD_SLOT_COUNT." */
+    uint8_t  reserved;          /**< @reserved @doc "must be 0." */
+    uint32_t decompressed_size; /**< @endian le @doc "optional parity-check hint for the switch-time tinfl decode (od_zlib_stream_reset's expected_output_size); 0 = skip the check. NOT used to size anything during the write itself, which only ever stores the compressed bytes as-is." */
+} __attribute__((packed));
+OD_STATIC_ASSERT(sizeof(struct PipeSlotExt) == 6, "PipeSlotExt wire size");
 
 /** @struct PipeStartResponse  @message CMD_PIPE_WRITE_START  @endian le
  *  @doc "6-byte PIPE START ACK data (device->host): the device echoes its

@@ -1,5 +1,6 @@
 #include "device_control.h"
 #include "structs.h"
+#include "display_service.h"
 #include "touch_input.h"
 #include "power_latch.h"
 #include "buzzer_control.h"
@@ -633,6 +634,48 @@ void processButtonEvents() {
         // reliably and "pressed" almost never.
         ble.boostAdvertising();   // no-op where the stack has no fast-adv window
         updatemsdata();
+
+        // LOCAL FORK DIVERGENCE (PSRAM slot storage, not upstream -- see
+        // display_service.h's odDisplayCycleSlot). Deliberately AFTER the
+        // advertising boost/publish above, never before: a slot switch blocks
+        // for the SPI transfer + panel refresh (up to ~2s), and running it
+        // first would delay the very advertisement the ordering above exists
+        // to get out promptly -- the same class of regression that comment
+        // describes fixing once already, just via a different mechanism (a
+        // long call in between rather than a wrong call order).
+        //
+        // button_id 0/1/2 -> the three physical buttons (KEY1/KEY2/KEY3 =
+        // GPIO2/GPIO3/GPIO5 on this board, all confirmed empirically), per
+        // this board's BinaryInputs config. Fires on press (logicalPressed),
+        // not release, so one push = one action. KEY1/KEY2 cycle through
+        // populated slots 1..OD_SLOT_COUNT-1 (only two buttons can't address
+        // 100 possible slots directly); slot 0 is excluded from that
+        // rotation on purpose (see odDisplayCycleSlot) since KEY3 is its
+        // dedicated shortcut -- a short press jumps straight there.
+        //
+        // KEY3's long-press bootloader-entry behaviour: checked this repo's
+        // source for any GPIO5-triggered download-mode logic (the ESP32-S3
+        // classic strap pin is GPIO0, not GPIO5, and none of this firmware's
+        // code touches GPIO5 for boot-mode purposes either) and found none --
+        // so whatever "long press KEY3" used to do was very likely a feature
+        // of the ORIGINAL/vendor firmware this board shipped with, before it
+        // ever ran OpenDisplay code, and may not apply to what's running now
+        // regardless of this change. What IS verified: every flash this
+        // project does goes through esptool's automatic DTR/RTS reset, never
+        // a manual button hold, so this change cannot take away the flashing
+        // method we actually rely on.
+        // Direction assignment (KEY1=back, KEY2=forward) was picked to match
+        // the physical layout after on-device testing showed the opposite
+        // felt backwards -- swap here, not in the BinaryInputs pin config,
+        // if it ever needs flipping again.
+        if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
+            ButtonState* btn = &buttonStates[changedButtonIndex];
+            if (btn->current_state == 1) {
+                if (btn->button_id == 0) odDisplayCycleSlot(-1);        // KEY1
+                else if (btn->button_id == 1) odDisplayCycleSlot(+1);   // KEY2
+                else if (btn->button_id == 2) odDisplayJumpToSlot(0);   // KEY3 (short press)
+            }
+        }
     }
 }
 
