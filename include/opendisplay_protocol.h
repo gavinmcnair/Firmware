@@ -640,14 +640,17 @@
  *                total_size exceeds this board's OD_SLOT_SIZE_BYTES).
  *            See SECTION 4; do NOT emit OD_ERR_PARTIAL_* here -- 0x03/0x05/
  *            0x06/0x07 mean different things in the two namespaces.
- * @state:    a new START aborts any in-flight transfer; seq resets to 0. A
- *            slot-target transfer never touches the panel controller: bytes
- *            land only in the addressed PSRAM slot, and CMD_PIPE_WRITE_END
- *            for it does NOT refresh the panel or wait for RESP_DIRECT_WRITE_
- *            REFRESH_COMPLETE -- it ACKs as soon as the slot is fully written.
- *            Slot contents are switched onto the panel only by a local
- *            (non-BLE) button-triggered path -- there is no BLE opcode to
- *            request a slot switch.
+ * @state:    a new START aborts any in-flight transfer; seq resets to 0. DATA
+ *            for a slot-target transfer never touches the panel controller:
+ *            bytes land only in the addressed PSRAM slot. CMD_PIPE_WRITE_END
+ *            for it ACKs as soon as the slot is fully written -- it never
+ *            sends or waits for RESP_DIRECT_WRITE_REFRESH_COMPLETE over BLE,
+ *            so the ACK is never gated on a refresh. If the written slot is
+ *            the one currently selected on the panel, END also triggers an
+ *            on-device (non-BLE) refresh right after ACKing, with no BLE
+ *            traffic of its own; writing to any other slot stays silent on
+ *            the panel until a later button press selects it. There is no
+ *            BLE opcode to request a slot switch directly.
  * @limits:   window/ack_every 1..32; frame <= PIPE_MAX_FRAME (244). slot_id
  *            0..99; a given board's OD_SLOT_COUNT may be smaller (PSRAM size
  *            varies by board) -- see OD_ERR_PIPE_START_SLOT_INVALID above.
