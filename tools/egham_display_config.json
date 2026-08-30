@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "minor_version": 1,
+  "packets": [
+    {
+      "id": "1",
+      "name": "system_config",
+      "fields": {
+        "ic_type": "2",
+        "communication_modes": "1",
+        "device_flags": "2",
+        "pwr_pin": "255",
+        "pwr_pin_2": "255",
+        "pwr_pin_3": "255"
+      }
+    },
+    {
+      "id": "2",
+      "name": "manufacturer_data",
+      "fields": {
+        "manufacturer_id": "1",
+        "board_type": "0",
+        "board_revision": "0",
+        "simple_config_driver_index": "0",
+        "simple_config_display_index": "0",
+        "simple_config_power_index": "0",
+        "simple_config_configured_at": "0"
+      }
+    },
+    {
+      "id": "4",
+      "name": "power_option",
+      "fields": {
+        "power_mode": "1",
+        "battery_capacity_mah": "0",
+        "sleep_timeout_ms": "30000",
+        "tx_power": "0",
+        "sleep_flags": "0",
+        "battery_sense_pin": "1",
+        "battery_sense_enable_pin": "6",
+        "battery_sense_flags": "0",
+        "capacity_estimator": "5",
+        "voltage_scaling_factor": "0",
+        "deep_sleep_current_ua": "0",
+        "deep_sleep_time_seconds": "0",
+        "charge_enable_pin": "255",
+        "charge_state_pin": "255",
+        "charger_flags": "0",
+        "min_wake_time_seconds": "120",
+        "screen_timeout_seconds": "5"
+      }
+    },
+    {
+      "id": "32",
+      "name": "display",
+      "fields": {
+        "instance_number": "0",
+        "display_technology": "1",
+        "panel_ic_type": "21",
+        "pixel_width": "800",
+        "pixel_height": "480",
+        "active_width_mm": "163",
+        "active_height_mm": "98",
+        "legacy_tagtype": "0",
+        "rotation": "0",
+        "reset_pin": "38",
+        "busy_pin": "4",
+        "dc_pin": "10",
+        "cs_pin": "44",
+        "data_pin": "9",
+        "partial_update_support": "0",
+        "color_scheme": "5",
+        "transmission_modes": "27",
+        "clk_pin": "7",
+        "reserved_pin_2": "255",
+        "reserved_pin_3": "255",
+        "reserved_pin_4": "255",
+        "reserved_pin_5": "255",
+        "reserved_pin_6": "255",
+        "reserved_pin_7": "255",
+        "reserved_pin_8": "255",
+        "full_update_mC": "4000"
+      }
+    },
+    {
+      "id": "37",
+      "name": "binary_input",
+      "fields": {
+        "instance_number": "0",
+        "input_type": "1",
+        "display_as": "0",
+        "reserved_pin_1": "2",
+        "reserved_pin_2": "3",
+        "reserved_pin_3": "5",
+        "reserved_pin_4": "255",
+        "reserved_pin_5": "255",
+        "reserved_pin_6": "255",
+        "reserved_pin_7": "255",
+        "reserved_pin_8": "255",
+        "input_flags": "7",
+        "invert": "7",
+        "pullups": "7",
+        "pulldowns": "0",
+        "button_data_byte_index": "0",
+        "power_off_flags": "0",
+        "power_off_hold_sec": "0"
+      }
+    }
+  ]
+}

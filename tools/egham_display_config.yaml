@@ -6,6 +6,13 @@
 # running that firmware all session, so these pins are proven working.
 # Panel IC type/color scheme use TRMNL's default (non-GEN2) profile, matching
 # what's already driving this physical unit successfully.
+#
+# egham_display_config.json (same directory) is the exact machine-readable
+# form of this file, in py-opendisplay's write-config JSON schema -- that's
+# the tool actually used to write it to the device (`opendisplay write-config
+# --device ODC48BB0 tools/egham_display_config.json`). If the two ever
+# drift, the JSON is the one that was actually applied; treat this YAML as
+# the human-readable reference and update both together.
 
 system_config:
   ic_type: 2                    # OD_IC_TYPE_ESP32S3
