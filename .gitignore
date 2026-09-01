@@ -99,3 +99,10 @@ compile_commands.json
 
 ### VS Code workspace
 *.code-workspace
+
+# Hybrid (arduino+espidf) env build artifacts -- esp32-s3-N16R8-pm.
+# sdkconfig.defaults IS tracked (it is the source); the per-env generated
+# sdkconfig and the downloaded IDF components are not. dependencies.lock
+# IS tracked: it pins the IDF component versions the hybrid build resolved.
+/managed_components/
+/sdkconfig.esp32-s3-N16R8-pm

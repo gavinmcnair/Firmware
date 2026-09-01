@@ -43,7 +43,7 @@ power_option:
   capacity_estimator: 5          # OD_CAPACITY_EST_SEEED_LI_ION (Seeed XIAO discharge curve)
   voltage_scaling_factor: 0
   deep_sleep_current_ua: 0
-  deep_sleep_time_seconds: 0     # disabled while actively testing
+  deep_sleep_time_seconds: 0     # DELIBERATELY disabled -- not a testing leftover. This board must accept BLE pushes at any moment (e.g. a train cancellation minutes before departure); a deep-sleeping ESP32 has its radio off, so any nonzero value here adds up to that many seconds of push latency. Flash-backed slots (docs/pipe-write-protocol.md section 10) would survive sleep fine -- it's the reachability requirement, not the slots, that keeps this at 0. Power savings must come from awake-state measures (CPU clock, advertising interval, light-sleep/modem-sleep if the IDF libs allow) instead.
   charge_enable_pin: 255
   charge_state_pin: 255
   charger_flags: 0

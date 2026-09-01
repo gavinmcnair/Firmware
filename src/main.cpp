@@ -304,6 +304,39 @@ void setup() {
 #ifdef TARGET_ESP32
     od_log_info("Heap: free=%u min=%u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
 #endif
+
+#if defined(TARGET_ESP32) && defined(CONFIG_PM_ENABLE)
+    // Hybrid (arduino+espidf) builds only -- see [env:esp32-s3-N16R8-pm] in
+    // platformio.ini; on stock arduino-libs builds CONFIG_PM_ENABLE is 0 and
+    // this block compiles out. Arms DFS + AUTOMATIC light sleep: from here on
+    // the chip sleeps whenever every task idles, and the BLE controller
+    // (modem sleep, main-XTAL low-power clock -- sdkconfig.defaults) keeps
+    // advertising / holding the connection through it, waking the CPU per
+    // radio event. This is what replaces deep-sleep duty cycling on boards
+    // that must stay reachable for a push at any moment: reachability of
+    // always-on at a small fraction of the current.
+    //
+    // Armed LAST in setup(), deliberately: panel init, FS mount, and BLE
+    // bring-up all run at full speed with no light-sleep edges, so any
+    // PM-sensitive misbehaviour is confined to steady-state where it is
+    // easiest to observe. min 40MHz = XTAL frequency, the floor the BLE
+    // controller tolerates; max 240MHz keeps refresh/decode fast (DFS only
+    // downshifts when idle). One known cost: USB-CDC logging goes quiet/
+    // glitchy while light-sleeping -- irrelevant on battery, and bench
+    // debugging belongs on the non-pm twin env anyway.
+    {
+        esp_pm_config_t pmConfig = {};
+        pmConfig.max_freq_mhz = 240;
+        pmConfig.min_freq_mhz = 40;
+        pmConfig.light_sleep_enable = true;
+        esp_err_t pmErr = esp_pm_configure(&pmConfig);
+        if (pmErr == ESP_OK) {
+            od_log_info("PM: DFS 240/40 MHz + automatic light sleep armed");
+        } else {
+            od_log_error("ERROR: esp_pm_configure failed: %d", (int)pmErr);
+        }
+    }
+#endif
 }
 
 uint32_t getDeepSleepCount() {
@@ -896,7 +929,15 @@ static void platformIdle() {
         // The min-wake hold covers first boot and connect-then-drop during a
         // button-wake window (woke_from_deep_sleep cleared on connect above).
         if (idleMs < idleHoldMs || minWakeHoldActive()) {
+#if defined(CONFIG_PM_ENABLE)
+            // PM builds: a 5 ms cadence wakes the chip 200x/s and starves
+            // tickless idle of sleepable windows. 100 ms chunks let light
+            // sleep actually engage; responsiveness survives because buttons
+            // are ISR-latched and BLE events wake the loop's next pass.
+            idleDelay(100);
+#else
             idleDelay(5);
+#endif
         } else {
             od_log_info("Idle %u ms (hold %u ms) - entering deep sleep", (unsigned)idleMs, (unsigned)idleHoldMs);
             enterDeepSleep();
@@ -907,7 +948,11 @@ static void platformIdle() {
         // connects mid-delay (the queued write waits out the delay before the
         // loop re-evaluates), which reads as a sluggish/unreliable first
         // exchange. Use the same short cadence as the battery idle-hold path.
+#if defined(CONFIG_PM_ENABLE)
+        idleDelay(100);   // PM builds: see the battery idle-hold branch above
+#else
         idleDelay(5);
+#endif
     }
     static uint32_t lastMsdUpdate = 0;
     if (millis() - lastMsdUpdate >= 60000) {

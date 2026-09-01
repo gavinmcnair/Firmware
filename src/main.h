@@ -74,6 +74,9 @@ extern "C" {
 #include <esp_mac.h>
 #include <esp_timer.h>
 #include "esp_sleep.h"
+#if defined(CONFIG_PM_ENABLE)
+#include "esp_pm.h"   // hybrid (arduino+espidf) envs only -- see sdkconfig.defaults
+#endif
 #include <WiFi.h>
 #include <ESPmDNS.h>
 

@@ -45,3 +45,20 @@ is a Rust client built on this feature — a plugin-based BLE pusher that
 renders independent pages (a live train-times board, an all-day weather
 forecast, an auto-generated index of what's on which slot) and pushes each to
 its own slot only when that page's content actually changed.
+
+## Light-sleep power management (this fork)
+
+The `esp32-s3-N16R8-pm` env builds hybrid (`framework = arduino, espidf`, root
+`sdkconfig.defaults`) to enable what the stock precompiled Arduino libraries
+compile out: `CONFIG_PM_ENABLE`, tickless idle, and BLE controller modem
+sleep. `main.cpp` then arms `esp_pm_configure()` (DFS 240/40 MHz + automatic
+light sleep) at the end of setup. The chip sleeps whenever the loop idles
+while the BLE controller keeps advertising / holding connections through it —
+always reachable for a push, at an estimated ~1–3 mA average instead of
+~25–40 mA. This is the battery answer for boards that must accept a BLE push
+at any moment and therefore keep `deep_sleep_time_seconds: 0` (deep sleep
+powers the radio off entirely; no ESP32 can wake on BLE from deep sleep).
+Validated on hardware 2026-09-01: steady ~300 ms advertising while
+light-sleeping, pipe writes, slot switches and buttons all working. Note:
+USB-CDC logging is unreliable under light sleep — bench debugging belongs on
+the stock `esp32-s3-N16R8` env.
