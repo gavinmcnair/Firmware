@@ -18,6 +18,9 @@
 #include "touch_input.h"
 #include "watchdog.h"
 #include "uzlib.h"
+#if OD_SLOT_STORE_ENABLED
+#include <LittleFS.h>   // flash-backed slot store (structs.h gate is ESP32-only)
+#endif
 #if defined(TARGET_ESP32) && defined(OPENDISPLAY_FASTEPD)
 #include "display_fastepd.h"
 #endif
@@ -612,15 +615,152 @@ static PipeReorderSlot* pipeReorder = nullptr;
 static PipeReorderSlot pipeReorder[PIPE_REORDER_SLOTS];
 #endif
 
-// PSRAM slot storage (LOCAL FORK DIVERGENCE -- see structs.h). `slots[]` itself
-// is just pointers/metadata (~12 B/entry, negligible even at 100 slots) and
-// always lives in ordinary static RAM; only the bytes each `.data` pointer
-// addresses come from one big PSRAM block reserved below, matching the
-// `pipeReorder` pattern above minus its internal-DRAM fallback (there is none
-// here: OD_SLOT_STORE_ENABLED is 0 on any board without PSRAM, so this array
-// is empty and reserveSlotBuffers() below is a no-op there).
+// Flash-backed slot storage (LOCAL FORK DIVERGENCE -- see structs.h). Each
+// slot is a LittleFS file (SLOT_DIR "/<id>", decimal id, no extension): an
+// 8-byte SlotFileHeader followed by the compressed image bytes. Files survive
+// deep sleep and power loss, which is the entire point -- the previous
+// PSRAM-resident design forced deep sleep off on battery boards because every
+// sleep wiped the slots. RAM keeps only:
+//   - slotValid[]: one validity flag per slot, rebuilt by ONE directory scan
+//     at boot (slotStoreInit) and flipped on each completed write -- the
+//     cycle/switch paths must not pay a filesystem walk per button press.
+//   - slotStaging: ONE 32KB PSRAM buffer shared by the write path (assembles
+//     the incoming compressed stream so the BLE hot path never blocks on
+//     flash-block erases mid-transfer) and the switch path (file read-back
+//     before decode). Sharing is safe: switches are refused while a transfer
+//     is active (transferActive()), both run on the loop task, and a
+//     transfer's staging content is flushed to its file before the END ACK
+//     that would let the client start anything else.
+//   - currentSlotIndex: which slot is on the panel. RTC_DATA_ATTR so it rides
+//     through deep sleep alongside the e-ink image it describes (both survive;
+//     ordinary statics do not). File-static per this repo's "no cross-file
+//     extern" convention (CLAUDE.md) -- device_control.cpp reaches it only
+//     through odDisplayCycleSlot()/odDisplayJumpToSlot().
 #if OD_SLOT_STORE_ENABLED
-static SlotBuffer slots[OD_SLOT_COUNT];
+static const char SLOT_DIR[] = "/slots";
+struct SlotFileHeader {
+    uint32_t magic;              // SLOT_FILE_MAGIC
+    uint32_t decompressed_size;  // PipeSlotExt hint; 0 = client sent none
+} __attribute__((packed));
+static const uint32_t SLOT_FILE_MAGIC = 0x3153444FUL;   // "ODS1" little-endian
+static bool     slotValid[OD_SLOT_MAX_COUNT];
+static uint8_t  slotCount = 0;          // usable slots on THIS board's filesystem (slotStoreInit)
+static uint8_t* slotStaging = nullptr;  // 32KB PSRAM, reserved once at boot
+static uint32_t slotStagingFill = 0;    // bytes of the in-flight slot transfer assembled so far
+static uint32_t slotStagingDecompressedSize = 0;   // PipeSlotExt hint for the in-flight transfer
+RTC_DATA_ATTR static uint8_t currentSlotIndex = 0;
+
+static void slotFilePath(uint8_t slot_index, char* out, size_t out_len) {
+    snprintf(out, out_len, "%s/%u", SLOT_DIR, (unsigned)slot_index);
+}
+
+// Mount, size, and index the slot store. Runs once, from odDisplayReserveBuffers.
+// Slot capacity is RUNTIME-derived: min(OD_SLOT_MAX_COUNT, usable FS bytes /
+// per-slot footprint), where the footprint pads OD_SLOT_SIZE_BYTES with one
+// 4KB LittleFS block of metadata and the reserve keeps the config file
+// (config_parser.cpp shares this filesystem) plus allocator slack out of
+// reach. So a 1.5MB partition (default_8MB.csv) yields ~39 slots and a 3.4MB
+// one (default_16MB.csv) the full 100 -- no per-env budget flag needed.
+// The validity index costs ONE directory walk, deliberately not a per-slot
+// exists() probe: each exists() re-walks the directory, and 100 of those at
+// boot is exactly the kind of boot-time cost FINDINGS.md documents this
+// battery device cannot afford.
+static void slotStoreInit(void) {
+    if (!LittleFS.begin(true)) {   // no-op success if config_parser already mounted it
+        od_log_error("ERROR: slot store: LittleFS mount failed -- slot storage disabled");
+        slotCount = 0;
+        return;
+    }
+    const uint32_t reserveBytes = 128u * 1024u;
+    const uint32_t footprint = OD_SLOT_SIZE_BYTES + 4096u;
+    uint32_t total = (uint32_t)LittleFS.totalBytes();
+    uint32_t usable = (total > reserveBytes) ? (total - reserveBytes) : 0;
+    uint32_t count = usable / footprint;
+    if (count > OD_SLOT_MAX_COUNT) count = OD_SLOT_MAX_COUNT;
+    slotCount = (uint8_t)count;
+    // RTC survivor sanity: a firmware/partition change across a deep sleep can
+    // shrink slotCount below what the RTC copy remembers. An out-of-range
+    // current slot must not wedge the cycle search's wrap arithmetic.
+    if (currentSlotIndex >= OD_SLOT_MAX_COUNT) currentSlotIndex = 0;
+    memset(slotValid, 0, sizeof(slotValid));
+    if (!LittleFS.exists(SLOT_DIR)) LittleFS.mkdir(SLOT_DIR);
+    uint32_t found = 0;
+    File dir = LittleFS.open(SLOT_DIR);
+    if (dir && dir.isDirectory()) {
+        for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+            if (f.isDirectory()) continue;
+            const char* name = f.name();   // basename on arduino-esp32 3.x
+            char* end = nullptr;
+            long id = strtol(name, &end, 10);
+            if (end == name || *end != '\0' || id < 0 || id >= (long)slotCount) continue;
+            if (f.size() < sizeof(SlotFileHeader) ||
+                f.size() - sizeof(SlotFileHeader) > OD_SLOT_SIZE_BYTES) continue;
+            SlotFileHeader hdr;
+            if (f.read((uint8_t*)&hdr, sizeof hdr) != sizeof hdr ||
+                hdr.magic != SLOT_FILE_MAGIC) continue;
+            slotValid[id] = true;
+            ++found;
+        }
+    }
+    od_log_info("Slot store: %u/%u slots populated, FS %u/%u KB used, current=%u",
+                (unsigned)found, (unsigned)slotCount,
+                (unsigned)(LittleFS.usedBytes() / 1024), (unsigned)(total / 1024),
+                (unsigned)currentSlotIndex);
+}
+
+// Persist the assembled staging buffer as slot_index's file. Write-to-temp +
+// atomic rename: a power cut or FS-full failure mid-write can never destroy
+// the slot's previous content -- lfs_rename replaces the destination
+// atomically, so the file either stays old or becomes fully new. ~32KB costs
+// on the order of 100-400 ms of flash I/O; the caller ACKs only after this
+// returns, because a slot END ACK's contract is "durably stored", not
+// "buffered in RAM".
+static bool slotWriteFile(uint8_t slot_index, uint32_t length, uint32_t decompressed_size) {
+    char tmpPath[16];
+    char path[16];
+    snprintf(tmpPath, sizeof tmpPath, "%s/.tmp", SLOT_DIR);
+    slotFilePath(slot_index, path, sizeof path);
+    File f = LittleFS.open(tmpPath, FILE_WRITE);
+    if (!f) {
+        od_log_error("ERROR: slot %u: temp file open failed (FS full?)", (unsigned)slot_index);
+        return false;
+    }
+    SlotFileHeader hdr = {SLOT_FILE_MAGIC, decompressed_size};
+    bool ok = f.write((const uint8_t*)&hdr, sizeof hdr) == sizeof hdr &&
+              f.write(slotStaging, length) == length;
+    f.close();
+    if (ok) ok = LittleFS.rename(tmpPath, path);
+    if (!ok) {
+        od_log_error("ERROR: slot %u: file write failed (%u B; FS full?)",
+                     (unsigned)slot_index, (unsigned)length);
+        LittleFS.remove(tmpPath);
+    }
+    return ok;
+}
+
+// Load slot_index's compressed bytes into slotStaging. Returns the byte count
+// loaded (0 = missing/corrupt -- the caller drops the slot's valid bit so the
+// cycle search skips it from now on) and the stored decompressed_size hint.
+static uint32_t slotReadFile(uint8_t slot_index, uint32_t* decompressed_size_out) {
+    char path[16];
+    slotFilePath(slot_index, path, sizeof path);
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) return 0;
+    SlotFileHeader hdr;
+    uint32_t length = 0;
+    if (f.size() >= sizeof hdr &&
+        f.size() - sizeof hdr <= OD_SLOT_SIZE_BYTES &&
+        f.read((uint8_t*)&hdr, sizeof hdr) == sizeof hdr &&
+        hdr.magic == SLOT_FILE_MAGIC) {
+        uint32_t payload = (uint32_t)f.size() - sizeof hdr;
+        if (payload > 0 && f.read(slotStaging, payload) == payload) {
+            *decompressed_size_out = hdr.decompressed_size;
+            length = payload;
+        }
+    }
+    f.close();
+    return length;
+}
 #endif
 
 void odDisplayReserveBuffers(void) {
@@ -650,26 +790,21 @@ void odDisplayReserveBuffers(void) {
     {
         static bool slotStoreReserved = false;
         if (slotStoreReserved) return;   // idempotent, same as pipeReorder above
-        // One contiguous block, not OD_SLOT_COUNT separate allocations --
-        // cheaper on the allocator and matches the pipeReorder pattern. Each
-        // slots[i].data points OD_SLOT_SIZE_BYTES apart into it.
-        uint8_t* base = (uint8_t*)heap_caps_calloc(OD_SLOT_COUNT, OD_SLOT_SIZE_BYTES,
-                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (base == nullptr) {
-            od_log_error("ERROR: slot store PSRAM reservation failed (%u x %u B) -- defective PSRAM?",
-                         (unsigned)OD_SLOT_COUNT, (unsigned)OD_SLOT_SIZE_BYTES);
+        // Slot CONTENT lives in LittleFS files (see the block comment at
+        // slotValid[] above); this reserves only the one 32KB staging buffer.
+        // Heap allocation justified per CLAUDE.md: one-time boot reservation,
+        // PSRAM-only, never freed -- identical lifecycle to pipeReorder above.
+        slotStaging = (uint8_t*)heap_caps_malloc(OD_SLOT_SIZE_BYTES,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (slotStaging == nullptr) {
+            od_log_error("ERROR: slot staging PSRAM reservation failed (%u B) -- defective PSRAM?",
+                         (unsigned)OD_SLOT_SIZE_BYTES);
             return;
         }
-        for (uint32_t i = 0; i < OD_SLOT_COUNT; ++i) {
-            slots[i].data = base + (size_t)i * OD_SLOT_SIZE_BYTES;
-            slots[i].length = 0;
-            slots[i].decompressed_size = 0;
-            slots[i].valid = false;
-        }
         slotStoreReserved = true;
-        od_log_info("Slot store: %u slots x %u B (%u B total) reserved in PSRAM, internal free=%u",
-                    (unsigned)OD_SLOT_COUNT, (unsigned)OD_SLOT_SIZE_BYTES,
-                    (unsigned)OD_SLOT_COUNT * OD_SLOT_SIZE_BYTES,
+        slotStoreInit();   // mount + runtime capacity + one-pass validity scan
+        od_log_info("Slot store: %u B staging reserved in PSRAM, internal free=%u",
+                    (unsigned)OD_SLOT_SIZE_BYTES,
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     }
 #endif
@@ -752,10 +887,11 @@ void checkTransferTimeouts(void) {
     // will never happen -- on nRF a delay(1) gate is below the tickless threshold
     // and spins rather than sleeping. Remove the state; do not idle on it.
     //
-    // LOCAL FORK DIVERGENCE (PSRAM slot storage): a slot-target session
+    // LOCAL FORK DIVERGENCE (flash-backed slot storage): a slot-target session
     // (pipeState.to_slot) is a THIRD legitimate case with no hardware half at
-    // all, by design -- it writes only into PSRAM and never touches the panel
-    // (see handlePipeWriteStart's slot-target branch). It has no panel power
+    // all, by design -- it assembles into the PSRAM staging buffer, touches
+    // flash only at END, and never touches the panel (see
+    // handlePipeWriteStart's slot-target branch). It has no panel power
     // or watchdog-worthy resource to leak if abandoned mid-transfer (unlike
     // direct-write/partial), so it doesn't need its own timeout here either --
     // a stuck one self-heals on the next 0x0080 START, which unconditionally
@@ -2602,29 +2738,38 @@ static void directWriteFinishAndRefresh(uint8_t* data, uint16_t len, uint8_t end
     }
 }
 
-// LOCAL FORK DIVERGENCE (PSRAM slot storage, not upstream -- see structs.h /
-// opendisplay_protocol.h PIPE_FLAG_SLOT_TARGET). Copies a stored slot's
-// compressed bytes to the panel controller and refreshes, with NO BLE traffic
-// at all -- this is the function a local button press drives. Deliberately
-// reuses directWriteComputeGeometry/directWriteActivatePanel/
-// zlib_stream_to_direct_write verbatim (the same proven decode+panel-write
-// path the BLE direct-write/PIPE_WRITE handlers use) rather than a parallel
-// reimplementation, since transferActive() below guarantees no live BLE
-// session is touching that state while we run. What is NOT reused is
-// directWriteFinishAndRefresh -- it unconditionally calls sendResponse() to
-// answer a BLE command, which would emit confusing unsolicited bytes to
-// whatever's connected; the refresh-trigger tail here is copied from it with
-// every sendResponse() call stripped, not reinvented.
+// LOCAL FORK DIVERGENCE (flash-backed slot storage, not upstream -- see
+// structs.h / opendisplay_protocol.h PIPE_FLAG_SLOT_TARGET). Reads a stored
+// slot's file into the staging buffer, decodes it to the panel controller and
+// refreshes, with NO BLE traffic at all -- this is the function a local
+// button press drives. Deliberately reuses directWriteComputeGeometry/
+// directWriteActivatePanel/zlib_stream_to_direct_write verbatim (the same
+// proven decode+panel-write path the BLE direct-write/PIPE_WRITE handlers
+// use) rather than a parallel reimplementation, since transferActive() below
+// guarantees no live BLE session is touching that state while we run. What is
+// NOT reused is directWriteFinishAndRefresh -- it unconditionally calls
+// sendResponse() to answer a BLE command, which would emit confusing
+// unsolicited bytes to whatever's connected; the refresh-trigger tail here is
+// copied from it with every sendResponse() call stripped, not reinvented.
 bool odDisplaySwitchToSlot(uint8_t slot_index) {
 #if OD_SLOT_STORE_ENABLED
-    if (slot_index >= OD_SLOT_COUNT || !slots[slot_index].valid) return false;
+    if (slot_index >= slotCount || !slotValid[slot_index] || slotStaging == nullptr) return false;
     // Never race a live BLE transfer for the shared directWrite*/pipeState
-    // globals this reuses. A switch request arriving mid-transfer is simply
-    // dropped -- a button press racing an active push is a user-timing edge
-    // case, not a protocol guarantee.
+    // globals this reuses (the staging buffer included -- an active slot
+    // transfer is assembling into it). A switch request arriving mid-transfer
+    // is simply dropped -- a button press racing an active push is a
+    // user-timing edge case, not a protocol guarantee.
     if (transferActive()) return false;
 
-    struct SlotBuffer& s = slots[slot_index];
+    // Flash read-back first (~tens of ms for 32KB): the panel stays untouched
+    // until the bytes are known present and well-formed.
+    uint32_t decompressedHint = 0;
+    uint32_t length = slotReadFile(slot_index, &decompressedHint);
+    if (length == 0) {
+        od_log_error("ERROR: slot %u file missing/corrupt -- dropping from index", (unsigned)slot_index);
+        slotValid[slot_index] = false;
+        return false;
+    }
 
     directWriteComputeGeometry(true);   // slots are always compressed at rest
     // Cross-check the client's optional hint (if it supplied one) against the
@@ -2632,9 +2777,9 @@ bool odDisplaySwitchToSlot(uint8_t slot_index) {
     // cheap and catches a stale/wrong slot early. directWriteTotalBytes (just
     // computed above) is the value that actually governs completion below,
     // not this hint.
-    if (s.decompressed_size != 0 && s.decompressed_size != directWriteTotalBytes) {
+    if (decompressedHint != 0 && decompressedHint != directWriteTotalBytes) {
         od_log_error("ERROR: slot %u decompressed_size hint (%u) != panel frame size (%u), refusing switch",
-                     (unsigned)slot_index, (unsigned)s.decompressed_size, (unsigned)directWriteTotalBytes);
+                     (unsigned)slot_index, (unsigned)decompressedHint, (unsigned)directWriteTotalBytes);
         return false;
     }
     directWriteDecompressedTotal = directWriteTotalBytes;
@@ -2648,9 +2793,9 @@ bool odDisplaySwitchToSlot(uint8_t slot_index) {
 #endif
     directWriteActivatePanel();   // epdSessionAcquire, bbepSetAddrWindow/StartWrite, od_zlib_stream_reset
 
-    // The whole compressed buffer is already resident in PSRAM -- one push
-    // with final=true, unlike the multi-call BLE-streaming case.
-    if (!zlib_stream_to_direct_write(s.data, s.length, true)) {
+    // The whole compressed buffer is now resident in the PSRAM staging area --
+    // one push with final=true, unlike the multi-call BLE-streaming case.
+    if (!zlib_stream_to_direct_write(slotStaging, length, true)) {
         cleanupDirectWriteState(true);   // fatal teardown, same as a BLE decode failure
         return false;
     }
@@ -2697,32 +2842,30 @@ bool odDisplaySwitchToSlot(uint8_t slot_index) {
 #endif
 }
 
-// Current slot shown via odDisplayCycleSlot, file-static per this repo's "no
-// cross-file extern" convention (see CLAUDE.md) -- device_control.cpp reaches
-// this only through odDisplayCycleSlot(), never the variable directly.
+// currentSlotIndex lives with the other slot-store globals at the top of this
+// file (RTC_DATA_ATTR -- it must survive deep sleep alongside the e-ink image
+// it describes).
 #if OD_SLOT_STORE_ENABLED
-static uint8_t currentSlotIndex = 0;
-
 bool odDisplayCycleSlot(int8_t direction) {
-    if (direction == 0) return false;
+    if (direction == 0 || slotCount == 0) return false;   // slotCount guard also keeps the % below defined
     // Search using a local candidate only -- currentSlotIndex must track what
     // is actually ON THE PANEL, so it's committed only once
     // odDisplaySwitchToSlot() confirms success below, never speculatively
     // during the search (a failed switch, e.g. a BLE transfer is active,
     // must leave currentSlotIndex exactly as it was).
     int32_t candidate = currentSlotIndex;
-    for (uint32_t step = 0; step < OD_SLOT_COUNT; ++step) {
-        // Signed arithmetic in an int32_t, then wrap into [0, OD_SLOT_COUNT)
-        // -- OD_SLOT_COUNT is small (<=100) so this never overflows.
+    for (uint32_t step = 0; step < slotCount; ++step) {
+        // Signed arithmetic in an int32_t, then wrap into [0, slotCount)
+        // -- slotCount is small (<=100) so this never overflows.
         candidate += (direction > 0 ? 1 : -1);
-        candidate = ((candidate % (int32_t)OD_SLOT_COUNT) + (int32_t)OD_SLOT_COUNT) % (int32_t)OD_SLOT_COUNT;
+        candidate = ((candidate % (int32_t)slotCount) + (int32_t)slotCount) % (int32_t)slotCount;
         if (candidate == currentSlotIndex) break;   // full cycle, nothing else populated
         // Slot 0 is the reserved index/home page (KEY3 jumps there directly,
         // see odDisplayJumpToSlot) -- KEY1/KEY2 cycling never lands on it,
         // valid or not, so it stays a distinct "home" rather than one more
         // stop in the rotation.
         if (candidate == 0) continue;
-        if (slots[candidate].valid) {
+        if (slotValid[candidate]) {
             if (!odDisplaySwitchToSlot((uint8_t)candidate)) return false;
             currentSlotIndex = (uint8_t)candidate;
             return true;
@@ -2952,19 +3095,20 @@ static bool pipeConsumePayload(uint8_t* data, uint16_t len) {
     // Slot-target transfers store the compressed bytes as-is (no zlib/gray4
     // handling on the write path at all -- decompression only happens later,
     // at switch time, in odDisplaySwitchToSlot) -- a plain bounds-checked
-    // memcpy into this slot's PSRAM region, nothing else. Simpler than the
-    // partial/direct-write branches below because there's no panel state to
-    // drive here at all.
+    // memcpy into the PSRAM staging buffer, nothing else. The flash write
+    // happens once, at END (slotWriteFile), never per-frame: a per-frame
+    // LittleFS append would stall the BLE window on 4KB block erases
+    // mid-transfer. Simpler than the partial/direct-write branches below
+    // because there's no panel state to drive here at all.
     if (pipeState.to_slot) {
 #if OD_SLOT_STORE_ENABLED
-        struct SlotBuffer& s = slots[pipeState.target_slot];
-        uint32_t remaining = (s.length < pipeState.total_size) ? (pipeState.total_size - s.length) : 0;
+        uint32_t remaining = (slotStagingFill < pipeState.total_size) ? (pipeState.total_size - slotStagingFill) : 0;
         uint16_t toWrite = (len > remaining) ? (uint16_t)remaining : len;
-        if (toWrite > 0) {
-            memcpy(s.data + s.length, data, toWrite);
-            s.length += toWrite;
+        if (toWrite > 0 && slotStaging != nullptr) {
+            memcpy(slotStaging + slotStagingFill, data, toWrite);
+            slotStagingFill += toWrite;
         }
-        imageWriteLogProgress(s.length, pipeState.total_size);
+        imageWriteLogProgress(slotStagingFill, pipeState.total_size);
 #endif
         return true;
     }
@@ -3104,10 +3248,23 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
             displayed_etag = 0; sendPipeStartNack(OD_ERR_PIPE_START_SIZE_MISMATCH); return;
         }
     } else if (slotTarget) {
-        // slotId >= OD_SLOT_COUNT correctly NACKs every slot-target request on a
-        // board with no slot support at all (OD_SLOT_COUNT == 0 there).
-        if (slotId >= OD_SLOT_COUNT) { sendPipeStartNack(OD_ERR_PIPE_START_SLOT_INVALID); return; }
+#if OD_SLOT_STORE_ENABLED
+        // Capacity is runtime-derived (slotStoreInit): slotCount is 0 when the
+        // filesystem failed to mount, which NACKs every slot-target request
+        // exactly like a board with no slot support at all.
+        if (slotId >= slotCount || slotStaging == nullptr) { sendPipeStartNack(OD_ERR_PIPE_START_SLOT_INVALID); return; }
         if (total_size == 0 || total_size > OD_SLOT_SIZE_BYTES) { sendPipeStartNack(OD_ERR_PIPE_START_SLOT_TOO_LARGE); return; }
+        // Slots are compressed-at-rest: the switch path always zlib-decodes
+        // (odDisplaySwitchToSlot), so an uncompressed slot payload could only
+        // ever garbage-decode later. Refuse it up front as an unsupported flag
+        // combination -- the same NACK the partial+slot combination gets, and
+        // the same NACK a slot-target request draws from firmware that
+        // predates the flag entirely.
+        if (!compressed) { sendPipeStartNack(OD_ERR_PIPE_START_UNKNOWN_FLAG); return; }
+#else
+        // No PSRAM staging on this board -- no slot support at all.
+        sendPipeStartNack(OD_ERR_PIPE_START_SLOT_INVALID); return;
+#endif
     } else {
         directWriteComputeGeometry(compressed);
         if (total_size != directWriteTotalBytes) { sendPipeStartNack(OD_ERR_PIPE_START_SIZE_MISMATCH); return; }
@@ -3142,16 +3299,18 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
     pipeState.to_slot = slotTarget;
     pipeState.target_slot = slotId;
 
-    // Reset this slot's metadata up front so an aborted/failed transfer never
-    // leaves stale bytes marked valid -- mirrors the partial path clearing
-    // displayed_etag on every failure above. Only handlePipeWriteEnd sets
-    // valid=true, once the whole transfer is confirmed complete.
+    // Stage the transfer in RAM only -- the slot's existing FILE (if any)
+    // stays valid and untouched until handlePipeWriteEnd atomically replaces
+    // it (slotWriteFile), so an aborted or failed transfer can no longer
+    // destroy the previous content the way the PSRAM-resident design did
+    // (which had to reuse the slot's only buffer as the landing zone).
 #if OD_SLOT_STORE_ENABLED
     if (slotTarget) {
-        slots[slotId].valid = false;
-        slots[slotId].length = 0;
-        slots[slotId].decompressed_size = slotDecompressedSize;
+        slotStagingFill = 0;
+        slotStagingDecompressedSize = slotDecompressedSize;
     }
+#else
+    (void)slotDecompressedSize;   // parsed above; unreachable here (slot STARTs NACK on this board)
 #endif
 
     // Partial transfers own partialCtx (two 1bpp planes); init it exactly as the 0x76
@@ -3195,10 +3354,11 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
 
     if (slotTarget) {
         // This path never touches the panel controller at all: no touch-suspend,
-        // no directWriteActivatePanel, nothing. Bytes land only in PSRAM via
-        // pipeConsumePayload's to_slot branch; CMD_PIPE_WRITE_END marks the slot
-        // valid and ACKs -- no refresh, no wait. That's the whole point: finishing
-        // a slot upload never blocks on panel bring-up or a refresh cycle.
+        // no directWriteActivatePanel, nothing. Bytes assemble in the PSRAM
+        // staging buffer via pipeConsumePayload's to_slot branch;
+        // CMD_PIPE_WRITE_END persists the slot's file and ACKs -- no refresh,
+        // no wait. That's the whole point: finishing a slot upload never
+        // blocks on panel bring-up or a refresh cycle.
         imageWriteLogReset();
         imageWriteLogStart(total_size);
         return;
@@ -3267,7 +3427,12 @@ void handlePipeWriteData(uint8_t* data, uint16_t len) {
         // refreshes with a FULL waveform. MUST be gated on !partial: a partial transfer never
         // touches directWrite* (both are 0), so 0>=0 would false-fire a FULL refresh on the very
         // first frame — partial transfers complete only on the explicit 0x0082 END (plan 1.5).
-        if (!pipeState.partial && !pipeState.compressed && directWriteBytesWritten >= directWriteTotalBytes) {
+        // Same gate on !to_slot for the identical reason: a slot-target transfer streams into
+        // the staging buffer, leaves directWrite* untouched, and completes only on the explicit
+        // END (which persists the file) — never mid-stream, and never with a panel refresh.
+        // (Slot STARTs currently require PIPE_FLAG_COMPRESSED so this arm is unreachable for
+        // them today; the gate keeps that a validation choice rather than a refresh hazard.)
+        if (!pipeState.partial && !pipeState.to_slot && !pipeState.compressed && directWriteBytesWritten >= directWriteTotalBytes) {
             sendPipeAck();                                   // final tail flush ({0x00,0x81})
             directWriteFinishAndRefresh(nullptr, 0, 0x82);   // {0x00,0x82} + FULL refresh, no etag
             resetPipeWriteState();
@@ -3341,26 +3506,32 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
     // Tail-flush ACK precedes the END result (plan 1.3c / 1.5).
     sendPipeAck();
 
-    // Slot-target transfers: a completed write marks the slot valid and ACKs.
-    // No panel refresh UNLESS this slot happens to be the one currently on
-    // screen (target_slot == currentSlotIndex) -- pushing to any other slot
-    // stays silent until a button selects it. A button press is still the
-    // only way to CHANGE which slot is selected; this only keeps the
-    // already-selected one live rather than showing stale data while a fresh
-    // version sits in PSRAM unseen.
+    // Slot-target transfers: a completed write is persisted to the slot's
+    // LittleFS file (write-temp + atomic rename, slotWriteFile) and THEN
+    // ACKed -- a slot END ACK's contract is "durably stored", so it must not
+    // go out before the flash write succeeds. The ~100-400 ms of flash I/O
+    // sits comfortably inside the client's END-ACK wait, unlike a panel
+    // refresh. No panel refresh UNLESS this slot happens to be the one
+    // currently on screen (target_slot == currentSlotIndex) -- pushing to any
+    // other slot stays silent until a button (or CMD_SLOT_SWITCH) selects it.
+    // This only keeps the already-selected slot live rather than showing
+    // stale data while a fresh version sits in flash unseen.
     if (pipeState.to_slot) {
 #if OD_SLOT_STORE_ENABLED
-        struct SlotBuffer& s = slots[pipeState.target_slot];
-        bool incompleteSlot = (pipeState.queued_count > 0) || (s.length != pipeState.total_size);
-        if (incompleteSlot) {
+        bool incompleteSlot = (pipeState.queued_count > 0) || (slotStagingFill != pipeState.total_size);
+        if (incompleteSlot ||
+            !slotWriteFile(pipeState.target_slot, slotStagingFill, slotStagingDecompressedSize)) {
             uint8_t n[2] = {RESP_NACK, 0x82};
             sendResponse(n, sizeof(n));
-            s.valid = false;
+            // The slot's previous file -- and its valid bit -- are deliberately
+            // untouched: only a successful atomic replace changes either, so a
+            // failed push can never take down the content a button press was
+            // still able to show a moment ago.
             resetPipeWriteState();
             return;
         }
-        imageWriteLogFinish(s.length, pipeState.total_size);
-        s.valid = true;
+        imageWriteLogFinish(slotStagingFill, pipeState.total_size);
+        slotValid[pipeState.target_slot] = true;
         uint8_t ackResponse[] = {RESP_ACK, 0x82};
         sendResponse(ackResponse, sizeof(ackResponse));
         // ACK goes out before the (potentially ~2s) refresh below, same
@@ -3371,7 +3542,9 @@ void handlePipeWriteEnd(uint8_t* data, uint16_t len) {
         // guards on transferActive(), which is still true while pipeState.active
         // holds -- calling it first would make this transfer see itself as "a
         // transfer in progress" and refuse to run. Capture target_slot first
-        // since reset zeroes it.
+        // since reset zeroes it. The switch re-reads the file it just wrote
+        // (~tens of ms) rather than trusting the staging buffer -- deliberate:
+        // it exercises the exact read path a post-sleep button press will use.
         uint8_t targetSlot = pipeState.target_slot;
         resetPipeWriteState();
         if (targetSlot == currentSlotIndex) {

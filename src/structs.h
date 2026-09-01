@@ -54,31 +54,36 @@ struct ImageData {
 #endif
 #define PIPE_REORDER_SLOT_SIZE  248    // >= max plaintext data payload (241 @ frame 244; 212 encrypted)
 
-// PSRAM slot storage (LOCAL FORK DIVERGENCE -- see opendisplay_protocol.h's
-// PIPE_FLAG_SLOT_TARGET, not synced from upstream). Each board declares its
-// own PSRAM budget for slots via OD_SLOT_STORE_PSRAM_BUDGET_BYTES
-// (platformio.ini build_flags), sized to that board's actual headroom -- PSRAM
-// capacity varies by board (8MB on most PSRAM envs, 2MB on esp32-s3-N4R2) and
-// is fixed at compile time, so slot count is DERIVED per board
-// (budget / 32KB), not a single hardcoded number. Boards with no PSRAM at all
-// compile the feature out entirely (OD_SLOT_COUNT 0) -- there's nowhere to put
-// slots. 32KB/slot was chosen with real margin over measured compression
-// ratios (real content: 8-15KB; adversarial synthetic fractal: 24,338 bytes).
+// Flash-backed slot storage (LOCAL FORK DIVERGENCE -- see
+// opendisplay_protocol.h's PIPE_FLAG_SLOT_TARGET, not synced from upstream).
+// Slots are LittleFS files ("/slots/<id>") on the board's existing data
+// partition, so they PERSIST across deep sleep and power loss -- the original
+// PSRAM-resident design lost every slot on the first deep-sleep cycle (an
+// ESP32 deep-sleep wake is a full reboot and PSRAM is unpowered through it),
+// which forced deep sleep off entirely on battery boards just to keep slots
+// alive. PSRAM now holds only ONE 32KB staging buffer (incoming-transfer
+// assembly + switch-time file read-back), so the gate is the same as before
+// minus the per-board budget flag: slot COUNT is derived at RUNTIME from the
+// mounted filesystem's size (slotStoreInit(), display_service.cpp), not from
+// a compile-time OD_SLOT_STORE_PSRAM_BUDGET_BYTES -- that flag is gone from
+// every env. OD_SLOT_MAX_COUNT is only the wire-protocol ceiling (slot_id is
+// 0..99) and the static bound of the validity index.
+// 32KB/slot was chosen with real margin over measured compression ratios
+// (real content: 8-15KB; adversarial synthetic fractal: 24,338 bytes).
 //
 // Deliberately NOT gated on OPENDISPLAY_ENABLE_WIFI (unlike the tinfl-engine
 // selection in od_inflate_tinfl.h, which this pattern otherwise resembles):
-// slot storage only needs PSRAM, nothing to do with WiFi/LAN transport.
-// esp32-wrover-e-N4R8 has BOARD_HAS_PSRAM but deliberately no WiFi -- gating
-// on OPENDISPLAY_ENABLE_WIFI would silently disable slots on a real 8MB-PSRAM
-// board for an unrelated reason.
-#if defined(TARGET_ESP32) && defined(BOARD_HAS_PSRAM) && \
-    defined(OD_SLOT_STORE_PSRAM_BUDGET_BYTES)
+// slot storage only needs PSRAM + a LittleFS partition, nothing to do with
+// WiFi/LAN transport. esp32-wrover-e-N4R8 has BOARD_HAS_PSRAM but
+// deliberately no WiFi -- gating on OPENDISPLAY_ENABLE_WIFI would silently
+// disable slots on a real PSRAM board for an unrelated reason.
+#if defined(TARGET_ESP32) && defined(BOARD_HAS_PSRAM)
 #define OD_SLOT_STORE_ENABLED  1
 #define OD_SLOT_SIZE_BYTES     (32u * 1024u)
-#define OD_SLOT_COUNT          (OD_SLOT_STORE_PSRAM_BUDGET_BYTES / OD_SLOT_SIZE_BYTES)
+#define OD_SLOT_MAX_COUNT      100u   /* protocol ceiling: slot_id is 0..99 on the wire */
 #else
 #define OD_SLOT_STORE_ENABLED  0
-#define OD_SLOT_COUNT          0
+#define OD_SLOT_MAX_COUNT      0
 #define OD_SLOT_SIZE_BYTES     0
 #endif
 
@@ -119,10 +124,11 @@ static_assert(OD_BLE_PREFERRED_ATT_MTU - 3u <= OD_BLE_MAX_FRAME,
 // [old_etag:4][x:2][y:2][w:2][h:2]; geometry/etag validated like 0x76, refresh
 // mode + new_etag ride the 0x0082 END. See PIPE_WRITE section in display_service.cpp.
 // PIPE_FLAG_SLOT_TARGET bit2 (mutually exclusive with bit1): writes into an
-// OD_SLOT_STORE_ENABLED PSRAM slot instead of the panel. START carries a
-// 6-byte LE PipeSlotExt [slot_id:1][reserved:1][decompressed_size:4]; END
-// never refreshes the panel for these transfers. See PIPE_WRITE section in
-// display_service.cpp and odDisplaySwitchToSlot().
+// OD_SLOT_STORE_ENABLED flash-backed slot instead of the panel. START carries
+// a 6-byte LE PipeSlotExt [slot_id:1][reserved:1][decompressed_size:4]; END
+// persists the slot's LittleFS file, then ACKs -- it never refreshes the
+// panel for these transfers. See PIPE_WRITE section in display_service.cpp
+// and odDisplaySwitchToSlot().
 
 struct PipeReorderSlot {
     bool     occupied;
@@ -131,27 +137,20 @@ struct PipeReorderSlot {
     uint8_t  data[PIPE_REORDER_SLOT_SIZE];
 };
 
-// One PSRAM-backed slot (see OD_SLOT_STORE_ENABLED above). `data` points into
-// a single contiguous heap_caps_calloc'd block reserved once at boot
-// (odDisplayReserveBuffers), not a per-slot allocation. `length` is the
-// COMPRESSED byte count actually stored -- slots are compressed-at-rest,
-// decompressed only at switch time (odDisplaySwitchToSlot). `valid`
-// distinguishes "never written" / "write aborted" from "complete and
-// switchable"; it is cleared at the start of every write into this slot and
-// only set true once CMD_PIPE_WRITE_END confirms the transfer completed.
-struct SlotBuffer {
-    uint8_t* data;
-    uint16_t length;             // compressed bytes actually stored
-    uint32_t decompressed_size;  // from PipeSlotExt; 0 = no parity-check hint
-    bool     valid;
-};
+// Slot content lives in LittleFS files, not RAM structs (see
+// OD_SLOT_STORE_ENABLED above): each slot file is an 8-byte SlotFileHeader
+// (display_service.cpp) followed by the COMPRESSED bytes -- slots are
+// compressed-at-rest, decompressed only at switch time
+// (odDisplaySwitchToSlot). Validity is a per-slot bit index in
+// display_service.cpp, rebuilt from one directory scan at boot and flipped
+// true only once CMD_PIPE_WRITE_END has atomically replaced the file.
 
 struct PipeWriteState {
     bool     active;
     bool     error;             // fatal: silently discard 0x0081 until next 0x0080 / disconnect
     bool     compressed;
     bool     partial;           // partial-region transfer: route DATA to partialCtx, END drives REFRESH_PARTIAL
-    bool     to_slot;           // slot-target transfer (PIPE_FLAG_SLOT_TARGET): route DATA into slots[target_slot], END never refreshes the panel. Mutually exclusive with `partial`.
+    bool     to_slot;           // slot-target transfer (PIPE_FLAG_SLOT_TARGET): route DATA into the staging buffer, END persists slot target_slot's file and never refreshes the panel. Mutually exclusive with `partial`.
     uint8_t  target_slot;       // valid only when to_slot is set
     bool     gap_open;          // true while a hole is outstanding (queue non-empty)
     uint8_t  window;            // W_eff

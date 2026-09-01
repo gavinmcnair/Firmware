@@ -57,20 +57,22 @@ void handlePipeWriteData(uint8_t* data, uint16_t len);
 void handlePipeWriteEnd(uint8_t* data, uint16_t len);
 void resetPipeWriteState(void);
 
-// LOCAL FORK DIVERGENCE (PSRAM slot storage, not upstream -- see
-// opendisplay_protocol.h's PIPE_FLAG_SLOT_TARGET). Copies slot_index's stored
-// compressed bytes to the panel controller and refreshes -- no BLE traffic at
-// all, safe to call from a local button-press handler. Returns false (no-op)
-// if slot storage is disabled on this board, the index is out of range or
-// unwritten, or a BLE transfer is currently active (transferActive()).
+// LOCAL FORK DIVERGENCE (flash-backed slot storage, not upstream -- see
+// opendisplay_protocol.h's PIPE_FLAG_SLOT_TARGET). Reads slot_index's stored
+// file (LittleFS, persists across deep sleep and power loss), decodes it to
+// the panel controller and refreshes -- no BLE traffic at all, safe to call
+// from a local button-press handler. Returns false (no-op) if slot storage is
+// disabled/unavailable on this board, the index is out of range or unwritten,
+// or a BLE transfer is currently active (transferActive()).
 bool odDisplaySwitchToSlot(uint8_t slot_index);
 
-// Scans slots[] for the next (direction > 0) or previous (direction < 0)
-// populated (valid) slot from the current position, wrapping at OD_SLOT_COUNT,
-// skipping unpopulated slots, and switches to it. Slot 0 is never a landing
-// spot for this scan (valid or not) -- it's the reserved index/home page,
-// reachable only via odDisplayJumpToSlot. No-op (returns false) if zero
-// non-zero slots are populated or slot storage is disabled on this board.
+// Scans the slot validity index for the next (direction > 0) or previous
+// (direction < 0) populated slot from the current position, wrapping at the
+// board's runtime slot capacity, skipping unpopulated slots, and switches to
+// it. Slot 0 is never a landing spot for this scan (valid or not) -- it's the
+// reserved index/home page, reachable only via odDisplayJumpToSlot. No-op
+// (returns false) if zero non-zero slots are populated or slot storage is
+// disabled on this board.
 bool odDisplayCycleSlot(int8_t direction);
 
 // Jumps directly to slot_index (used for KEY3 -> slot 0, the reserved

@@ -635,8 +635,8 @@ void processButtonEvents() {
         ble.boostAdvertising();   // no-op where the stack has no fast-adv window
         updatemsdata();
 
-        // LOCAL FORK DIVERGENCE (PSRAM slot storage, not upstream -- see
-        // display_service.h's odDisplayCycleSlot). Deliberately AFTER the
+        // LOCAL FORK DIVERGENCE (flash-backed slot storage, not upstream --
+        // see display_service.h's odDisplayCycleSlot). Deliberately AFTER the
         // advertising boost/publish above, never before: a slot switch blocks
         // for the SPI transfer + panel refresh (up to ~2s), and running it
         // first would delay the very advertisement the ordering above exists
@@ -647,9 +647,9 @@ void processButtonEvents() {
         // button_id 0/1/2 -> the three physical buttons (KEY1/KEY2/KEY3 =
         // GPIO2/GPIO3/GPIO5 on this board, all confirmed empirically), per
         // this board's BinaryInputs config. Fires on press (logicalPressed),
-        // not release, so one push = one action. KEY1/KEY2 cycle through
-        // populated slots 1..OD_SLOT_COUNT-1 (only two buttons can't address
-        // 100 possible slots directly); slot 0 is excluded from that
+        // not release, so one push = one action. KEY1/KEY2 cycle through the
+        // populated slots above 0 (only two buttons can't address up to 100
+        // possible slots directly); slot 0 is excluded from that
         // rotation on purpose (see odDisplayCycleSlot) since KEY3 is its
         // dedicated shortcut -- a short press jumps straight there.
         //

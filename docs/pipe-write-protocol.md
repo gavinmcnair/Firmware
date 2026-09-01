@@ -561,7 +561,7 @@ implemented in py-opendisplay (`device.py` `_maybe_upload_partial` /
 
 ---
 
-## 10. PSRAM slot storage (`PIPE_FLAG_SLOT_TARGET`) — LOCAL FORK DIVERGENCE
+## 10. Persistent slot storage (`PIPE_FLAG_SLOT_TARGET`) — LOCAL FORK DIVERGENCE
 
 > **This entire section documents a local fork divergence.** `PIPE_FLAG_SLOT_TARGET`,
 > its wire extension, the two new NACK codes, and the on-device switching path are
@@ -581,11 +581,20 @@ a trains page and a weather page) a full BLE round trip every time: negotiate,
 stream, refresh. On BLE that round trip dominates — 10s+ — even though the
 underlying SPI transfer and panel refresh together take a couple of seconds.
 
-Slot storage lets a client push several pages ahead of time into fixed,
-board-sized regions of PSRAM, kept independently up to date (e.g. the trains
-page re-pushed every 5 minutes, the weather page whenever the forecast changes).
-A physical button press then switches which slot is on the panel entirely
-on-device — SPI + decompress + refresh, no BLE involved at press time. See the
+Slot storage lets a client push several pages ahead of time into fixed-size
+on-device slots, kept independently up to date (e.g. the trains page re-pushed
+every 5 minutes, the weather page whenever the forecast changes). A physical
+button press then switches which slot is on the panel entirely on-device —
+flash read + decompress + refresh, no BLE involved at press time.
+
+Slots are **flash-backed** (LittleFS files) and therefore **persist across
+deep sleep and power loss**. This matters more than it sounds: the first
+iteration of this feature kept slots in PSRAM, and an ESP32 deep-sleep wake is
+a full reboot with PSRAM unpowered — every sleep cycle wiped every slot, which
+forced `deep_sleep_time_seconds: 0` (never sleep) on battery boards just to
+keep the feature alive, at a cost of roughly days-instead-of-months of battery
+life. With flash-backed slots, a battery board deep-sleeps normally: a button
+press wakes it, the slot is read back from flash, and the panel refreshes. See the
 [`gavinmcnair/opendisplay-pages`](https://github.com/gavinmcnair/opendisplay-pages)
 Rust client for a working multi-page implementation built on this: it renders
 each page (trains, weather, an auto-generated index) independently, pushes each
@@ -595,33 +604,38 @@ reserves slot 0 for the index.
 ### 10.2 Per-board slot count and size
 
 Slot storage is compile-time gated on `OD_SLOT_STORE_ENABLED`
-([structs.h](../src/structs.h)), which requires both `BOARD_HAS_PSRAM` and a
-board-supplied `OD_SLOT_STORE_PSRAM_BUDGET_BYTES` build flag
-([platformio.ini](../platformio.ini)). Boards without PSRAM compile the feature
-out entirely — `OD_SLOT_COUNT` is `0`, and every slot-target START NACKs
-`SLOT_INVALID` (§10.4) on those builds, same as an out-of-range `slot_id` on a
-PSRAM board.
+([structs.h](../src/structs.h)) = `TARGET_ESP32 && BOARD_HAS_PSRAM` — no
+per-board budget build flag any more. Boards without PSRAM compile the feature
+out entirely, and every slot-target START NACKs `SLOT_INVALID` (§10.4) there.
 
-Each slot is a fixed `OD_SLOT_SIZE_BYTES` (32KB) region, sized with real margin
-over measured real-page compression ratios (8–15KB typical). `OD_SLOT_COUNT =
-OD_SLOT_STORE_PSRAM_BUDGET_BYTES / OD_SLOT_SIZE_BYTES` — derived per board, not
-a single constant across the fleet: 8MB-PSRAM boards get 100 slots (3.2MB
-budget), the smaller `esp32-s3-N4R2` gets fewer. The wire field `slot_id` is
-always `0..99` regardless of board (§10.4); a board with a smaller derived
-`OD_SLOT_COUNT` just NACKs the ids above its own ceiling.
+Each slot is one LittleFS file (`/slots/<id>`, decimal, no extension) on the
+board's existing data partition — the same filesystem `config_parser.cpp`
+already mounts for the device config. A slot file is an 8-byte header
+(`"ODS1"` magic + the `decompressed_size` hint) followed by the compressed
+payload, capped at `OD_SLOT_SIZE_BYTES` (32KB), which is sized with real
+margin over measured real-page compression ratios (8–15KB typical).
 
-All `OD_SLOT_COUNT` slots share **one contiguous** `heap_caps_calloc` allocation
-made once at boot in `odDisplayReserveBuffers()`
-([display_service.cpp:649-672](../src/display_service.cpp)) — not one
-allocation per slot — matching this repo's "avoid heap allocation where
-possible, and justify what you can't avoid" rule. `slots[i].data` points
-`OD_SLOT_SIZE_BYTES` apart into that one block
-([display_service.cpp:622-664](../src/display_service.cpp)).
+Slot **capacity is derived at runtime**, not compile time (`slotStoreInit()`,
+[display_service.cpp](../src/display_service.cpp)):
+`min(100, (fs_total − 128KB reserve) / (32KB + one 4KB metadata block))`. So a
+1.5MB partition (`default_8MB.csv`) yields ~39 slots and a 3.4MB one
+(`default_16MB.csv`) the full 100 — flash size, not PSRAM size, is what varies
+the ceiling per board now. The wire field `slot_id` is always `0..99`
+regardless (§10.4); a board with a smaller runtime capacity just NACKs the ids
+above its own ceiling. If the filesystem fails to mount, capacity is 0 and the
+feature degrades to NACKs, never a crash.
 
-Slots store their payload **compressed at rest**; decompression happens only at
-switch time (§10.5). 100 slots held decompressed (96,000 bytes/page) would need
-9.6MB — more PSRAM than an 8MB board has at all. Compressed-at-rest is what
-makes the slot count/size arithmetic work.
+PSRAM still carries the feature's RAM half: **one** 32KB staging buffer,
+reserved once at boot in `odDisplayReserveBuffers()` (same justified-heap
+pattern as the pipe reorder queue). The write path assembles the incoming
+stream there so the BLE hot path never blocks on flash-block erases
+mid-transfer, and the switch path reads the slot file back into it before
+decoding. A per-slot validity index (rebuilt by one directory scan at boot)
+keeps button presses from paying a filesystem walk.
+
+Slots store their payload **compressed at rest**; decompression happens only
+at switch time (§10.5). A slot-target START therefore now **requires**
+`PIPE_FLAG_COMPRESSED` — see §10.4.
 
 ### 10.3 What a slot-target START looks like on the wire
 
@@ -629,21 +643,25 @@ Same `CMD_PIPE_WRITE_START` (`0x0080`) opcode as every other pipe transfer, with
 `flags` bit2 (`PIPE_FLAG_SLOT_TARGET`, `0x04`) set. This is **mutually exclusive
 with `PIPE_FLAG_PARTIAL`** (bit1) — a request setting both NACKs
 `UNKNOWN_FLAG` (`0x02`) — since slot storage never needs partial-region
-semantics (a slot always holds a whole page).
+semantics (a slot always holds a whole page). It also **requires
+`PIPE_FLAG_COMPRESSED`** (bit0): slots are compressed-at-rest and the switch
+path always zlib-decodes, so an uncompressed slot payload could only
+garbage-decode later — bit2 without bit0 NACKs `UNKNOWN_FLAG` up front, the
+same NACK a slot-target request draws from firmware predating the flag.
 
 The request carries a **6-byte little-endian `PipeSlotExt` extension** appended
 after `total_size` (post-opcode length 16, not 10):
 
 | Offset | Field                | Size | Notes                                                              |
 |--------|----------------------|------|---------------------------------------------------------------------|
-| 10     | `slot_id`            | 1    | `0..99`; must be `< OD_SLOT_COUNT` for this board                   |
+| 10     | `slot_id`            | 1    | `0..99`; must be below this board's runtime slot capacity (§10.2)  |
 | 11     | `reserved`           | 1    | Must be `0`                                                          |
 | 12–15  | `decompressed_size`  | 4 LE | Optional parity-check hint used at switch time (§10.5); `0` skips the check — **not** used to size anything during the write itself |
 
 Unlike the full-frame and partial paths, `total_size` here means **the
 compressed byte total actually being stored** (slot storage is
 compressed-at-rest), and must satisfy `0 < total_size <= OD_SLOT_SIZE_BYTES`
-for this board — not the decompressed panel/plane geometry §2.2 computes for
+(32KB) — not the decompressed panel/plane geometry §2.2 computes for
 the other two paths. `decompressed_size` in the extension is a separate,
 optional field for the switch-time decode, unrelated to the write-time size
 check.
@@ -651,19 +669,25 @@ check.
 ### 10.4 START validation and NACKs
 
 Validated in `handlePipeWriteStart`
-([display_service.cpp:2982-3120](../src/display_service.cpp), slot-target logic
-at 3083-3120), before any hardware or PSRAM slot is touched (same
+([display_service.cpp](../src/display_service.cpp), slot-target arm of the
+`total_size` validation), before any hardware or storage is touched (same
 validate-before-touching-state pattern as the partial path):
 
-1. `slot_id >= OD_SLOT_COUNT` → NACK `SLOT_INVALID` (`0x04`). This correctly
-   also covers "slot storage unsupported on this board" — a board with no PSRAM
-   budget has `OD_SLOT_COUNT == 0`, so every `slot_id` is out of range.
+1. `slot_id >=` the board's runtime slot capacity, or the staging buffer was
+   never reserved → NACK `SLOT_INVALID` (`0x04`). This correctly also covers
+   "slot storage unsupported on this board" — capacity is 0 wherever the
+   feature is compiled out or the filesystem failed to mount, so every
+   `slot_id` is out of range there.
 2. `total_size == 0 || total_size > OD_SLOT_SIZE_BYTES` → NACK `SLOT_TOO_LARGE`
    (`0x08`).
-3. On success: `pipeState.to_slot = true; pipeState.target_slot = slot_id;`
-   ([display_service.cpp:3119-3120](../src/display_service.cpp)), and that
-   slot's `valid` flag is cleared so an aborted transfer never leaves stale
-   bytes marked valid.
+3. `PIPE_FLAG_COMPRESSED` unset → NACK `UNKNOWN_FLAG` (`0x02`) — see §10.3.
+4. On success: `pipeState.to_slot = true; pipeState.target_slot = slot_id;`
+   and the staging fill counter resets. The slot's existing **file stays valid
+   and untouched** until END atomically replaces it — an aborted or failed
+   transfer can never destroy the previous content, so a button press
+   mid-upload still shows the old page (an improvement over the PSRAM design,
+   which had to reuse the slot's only buffer as the landing zone and so
+   invalidated it at START).
 
 A slot-target START **never calls** `directWriteComputeGeometry()` or
 `directWriteActivatePanel()` — this path never touches the panel at negotiation
@@ -672,18 +696,23 @@ time, unlike every other START variant in this document.
 ### 10.5 DATA and END — storage only, no panel, no refresh wait
 
 `pipeConsumePayload()`'s `to_slot` branch
-([display_service.cpp:2926-2947](../src/display_service.cpp), the `to_slot` arm
-at 2935-2946) is the simplest of the three payload routes in this document: a
-bounds-checked `memcpy` of each frame's bytes into `slots[target_slot].data` at
-the current write offset, `length` bumped to match. Compressed bytes are
-stored exactly as received — **no zlib inflate, no gray4 plane split, no
-controller write** on this path at all (contrast with the full-frame and
-partial routes, both of which decode/write to the panel as data arrives).
+([display_service.cpp](../src/display_service.cpp)) is the simplest of the
+three payload routes in this document: a bounds-checked `memcpy` of each
+frame's bytes into the 32KB PSRAM staging buffer at the current fill offset.
+Compressed bytes are staged exactly as received — **no zlib inflate, no gray4
+plane split, no controller write, and no flash I/O** on this path at all
+(contrast with the full-frame and partial routes, both of which decode/write
+to the panel as data arrives; flash is deliberately deferred to END so BLE
+frames never stall on 4KB block erases).
 
 `CMD_PIPE_WRITE_END` for a slot-target transfer
-([display_service.cpp:3321-3357](../src/display_service.cpp)) marks
-`slots[target_slot].valid = true` and sends the END ACK (`0x00 0x82`)
-immediately — **before** any refresh, not after waiting for one. It does
+([display_service.cpp](../src/display_service.cpp)) **persists the staged
+bytes to the slot's file first** — write-to-temp then atomic `rename`, so a
+power cut mid-write leaves the previous content intact — marks the slot valid,
+and only then sends the END ACK (`0x00 0x82`): a slot END ACK means *durably
+stored*, surviving deep sleep and power loss. The ~100–400ms of flash I/O sits
+inside the client's normal END-ACK wait. The ACK still goes out **before** any
+refresh, not after waiting for one. It does
 **not** send or wait for `RESP_DIRECT_WRITE_REFRESH_COMPLETE`
 (`0x00 0x73`/`0x00 0x74`, §6.4) **over BLE, ever**, for this path. What happens
 next depends on whether the written slot is the one currently selected on the
@@ -702,8 +731,10 @@ same class of mistake on the partial path).
 
 Auto-complete (§6.3) does not apply to slot-target transfers either, for the
 same reason it's gated off for partial transfers: it's driven by
-`directWriteBytesWritten`, which a slot-target transfer never touches.
-Completion is END-only.
+`directWriteBytesWritten`, which a slot-target transfer never touches — and
+the auto-complete condition is now explicitly gated on `!pipeState.to_slot`
+(alongside the existing `!pipeState.partial`), so this is enforced rather than
+merely implied. Completion is END-only.
 
 ### 10.6 On-device switching
 
@@ -724,13 +755,16 @@ Slot contents also still reach the panel through the original local, non-BLE
 path: `odDisplaySwitchToSlot(slot_index)`
 ([display_service.cpp:2618-2699](../src/display_service.cpp)), which:
 
-1. Refuses if `slot_index` is out of range, that slot's `valid` flag is unset,
-   or a BLE transfer is currently active (`transferActive()`) — a switch
-   request racing a live transfer is silently dropped, not queued.
-2. Decompresses the whole stored slot in one call via the existing streaming
-   `tinfl`/`od_zlib_stream_*` API, reusing the same 2048-byte
-   `decompressionChunk` scratch buffer the BLE-streaming paths already use —
-   **no new heap allocation** for the switch itself.
+1. Refuses if `slot_index` is out of range, that slot's validity bit is
+   unset, or a BLE transfer is currently active (`transferActive()`) — a
+   switch request racing a live transfer is silently dropped, not queued.
+2. Reads the slot's file back into the 32KB PSRAM staging buffer (~tens of ms;
+   the panel stays untouched until the bytes are known present and
+   well-formed — a missing/corrupt file drops the slot's validity bit so the
+   cycle search skips it from then on), then decompresses it in one call via
+   the existing streaming `tinfl`/`od_zlib_stream_*` API, reusing the same
+   2048-byte `decompressionChunk` scratch buffer the BLE-streaming paths
+   already use — **no new heap allocation** for the switch itself.
 3. Drains the decompressed stream to the panel via the same
    `directWriteActivatePanel()`/`directWriteFinishAndRefresh()` primitives the
    BLE paths use internally, but as a standalone sequence with no BLE response
@@ -743,15 +777,18 @@ Two higher-level wrappers, both gated the same `OD_SLOT_STORE_ENABLED` way
 [display_service.cpp:2740-2741](../src/display_service.cpp)):
 
 - `odDisplayCycleSlot(int8_t direction)`
-  ([display_service.cpp:2706-2733](../src/display_service.cpp)) — scans forward
-  (`+1`) or backward (`-1`) from a file-static "current slot" index for the
-  next **valid** slot, wrapping at `OD_SLOT_COUNT`, and **deliberately skips
-  slot 0** ([display_service.cpp:2718-2726](../src/display_service.cpp)) — the
-  index page (§10.1) is reachable directly via `odDisplayJumpToSlot(0)`
+  ([display_service.cpp](../src/display_service.cpp)) — scans forward (`+1`)
+  or backward (`-1`) from the current-slot index for the next **valid** slot,
+  wrapping at the runtime slot capacity, and **deliberately skips slot 0** —
+  the index page (§10.1) is reachable directly via `odDisplayJumpToSlot(0)`
   instead, so cycling through content pages never lands on it by accident.
 - `odDisplayJumpToSlot(slot_index)`
-  ([display_service.cpp:2734-2739](../src/display_service.cpp)) — switches
-  directly to a specific slot, no scan, no skip rule (used for slot 0).
+  ([display_service.cpp](../src/display_service.cpp)) — switches directly to a
+  specific slot, no scan, no skip rule (used for slot 0).
+
+The current-slot index is `RTC_DATA_ATTR`: it survives deep sleep alongside
+the e-ink image it describes, so after a wake the buttons cycle from the right
+position and a re-push of the on-screen slot still auto-refreshes (§10.5).
 
 ### 10.7 Button wiring
 
