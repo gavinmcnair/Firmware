@@ -41,7 +41,7 @@ power_option:
   battery_sense_enable_pin: 6    # matches TRMNL's PIN_VBAT_SWITCH (load-switch enable)
   battery_sense_flags: 0         # VBAT_SWITCH_LEVEL was HIGH (non-inverted) on TRMNL's config
   capacity_estimator: 5          # OD_CAPACITY_EST_SEEED_LI_ION (Seeed XIAO discharge curve)
-  voltage_scaling_factor: 0
+  voltage_scaling_factor: 161    # (3.3V / 4095 counts) x 2:1 divider x 100000 -- verified live 2026-09-01, panel reports 3.97V
   deep_sleep_current_ua: 0
   deep_sleep_time_seconds: 0     # DELIBERATELY disabled -- not a testing leftover. This board must accept BLE pushes at any moment (e.g. a train cancellation minutes before departure); a deep-sleeping ESP32 has its radio off, so any nonzero value here adds up to that many seconds of push latency. Flash-backed slots (docs/pipe-write-protocol.md section 10) would survive sleep fine -- it's the reachability requirement, not the slots, that keeps this at 0. Power savings must come from awake-state measures (CPU clock, advertising interval, light-sleep/modem-sleep if the IDF libs allow) instead.
   charge_enable_pin: 255
