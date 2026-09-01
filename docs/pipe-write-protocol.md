@@ -209,7 +209,7 @@ geometry check is pure config math before any hardware is touched).
 | `0x01` | Bad length (`len < 10`, `len < 22` when partial, or `len < 16` when slot-target) or version mismatch |
 | `0x02` | Unsupported flag bits set (includes setting both `PIPE_FLAG_PARTIAL` and `PIPE_FLAG_SLOT_TARGET` — mutually exclusive) |
 | `0x03` | `total_size` disagrees with device geometry (full: `directWriteComputeGeometry`; partial: `plane_size * 2`) |
-| `0x04` | **Slot-target:** `slot_id` out of range for this board, or slot storage disabled here (`OD_SLOT_COUNT == 0`) (`SLOT_INVALID`, §10) — **LOCAL FORK DIVERGENCE** |
+| `0x04` | **Slot-target:** `slot_id` out of range for this board's runtime slot capacity, or slot storage unsupported/disabled here (`SLOT_INVALID`, §10) — **LOCAL FORK DIVERGENCE** |
 | `0x05` | **Partial:** `old_etag` is 0 or does not match the on-panel `displayed_etag` (`ETAG_MISMATCH`) |
 | `0x06` | **Partial:** panel is not 1bpp, or is a seeed/IT8951 driver with no controller-plane mechanism (`PARTIAL_UNSUPPORTED`) |
 | `0x07` | **Partial:** rectangle is empty, out of bounds, or `x`/`w` not byte-aligned (`RECT_INVALID`) |
@@ -619,7 +619,7 @@ Slot **capacity is derived at runtime**, not compile time (`slotStoreInit()`,
 [display_service.cpp](../src/display_service.cpp)):
 `min(100, (fs_total − 128KB reserve) / (32KB + one 4KB metadata block))`. So a
 1.5MB partition (`default_8MB.csv`) yields ~39 slots and a 3.4MB one
-(`default_16MB.csv`) the full 100 — flash size, not PSRAM size, is what varies
+(`default_16MB.csv`) 92 — flash size, not PSRAM size, is what varies
 the ceiling per board now. The wire field `slot_id` is always `0..99`
 regardless (§10.4); a board with a smaller runtime capacity just NACKs the ids
 above its own ceiling. If the filesystem fails to mount, capacity is 0 and the
@@ -710,7 +710,12 @@ frames never stall on 4KB block erases).
 bytes to the slot's file first** — write-to-temp then atomic `rename`, so a
 power cut mid-write leaves the previous content intact — marks the slot valid,
 and only then sends the END ACK (`0x00 0x82`): a slot END ACK means *durably
-stored*, surviving deep sleep and power loss. The ~100–400ms of flash I/O sits
+stored*, surviving deep sleep and power loss. The 2-byte END NACK
+(`0xFF 0x82`) therefore has a second cause on this path: a **storage failure**
+(temp-file open/write/rename failed — typically filesystem full), which is
+indistinguishable on the wire from an incomplete transfer; a client whose
+clean retransmit NACKs again should treat the condition as persistent. The
+slot's previous file and validity are untouched by either failure. The ~100–400ms of flash I/O sits
 inside the client's normal END-ACK wait. The ACK still goes out **before** any
 refresh, not after waiting for one. It does
 **not** send or wait for `RESP_DIRECT_WRITE_REFRESH_COMPLETE`

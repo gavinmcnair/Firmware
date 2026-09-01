@@ -148,6 +148,7 @@ struct PipeReorderSlot {
 struct PipeWriteState {
     bool     active;
     bool     error;             // fatal: silently discard 0x0081 until next 0x0080 / disconnect
+    uint32_t start_ms;          // millis() at START; only the slot-target watchdog reads it (direct/partial carry their own stamps)
     bool     compressed;
     bool     partial;           // partial-region transfer: route DATA to partialCtx, END drives REFRESH_PARTIAL
     bool     to_slot;           // slot-target transfer (PIPE_FLAG_SLOT_TARGET): route DATA into the staging buffer, END persists slot target_slot's file and never refreshes the panel. Mutually exclusive with `partial`.

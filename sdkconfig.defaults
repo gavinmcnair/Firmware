@@ -21,11 +21,16 @@ CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# 32768 is a deliberate divergence from the arduino-libs baseline (0): keep a
+# DMA/internal cushion since this build's allocations weren't tuned against a
+# zero reserve. The DEFAULT_CPU_FREQ line above IS baseline parity -- bare IDF
+# defaults to 160MHz, which would slow every boot phase before esp_pm_configure.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 
 #
@@ -49,6 +54,14 @@ CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_ESP_PHY_MAC_BB_PD=y
+# The S3's USB-Serial-JTAG dies in light sleep and does NOT recover on wake:
+# without this, the first idle light-sleep kills the USB port until reboot --
+# no serial monitor and, worse, no esptool reflash (learned the hard way; the
+# device had to be rebooted over BLE to get the port back). This option holds
+# an ESP_PM_NO_LIGHT_SLEEP lock ONLY while USB is actually connected: plugged
+# into a bench, the device stays flashable/monitorable at DFS-level savings;
+# on battery (no USB), full light sleep engages as designed.
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 
 #
 # TLS-PSK for the LAN transport (wifi_service.cpp's mbedtls_ssl_conf_psk):
@@ -58,6 +71,11 @@ CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
 
 #
-# Task watchdog parity with the arduino-only envs' 120s setting
+# Task watchdog. NOT 120: this Kconfig's legal range is 1..60 and an
+# out-of-range default is silently DISCARDED (falls back to 5s), not clamped
+# -- caught in review against the generated sdkconfig. 60 is the maximum.
+# (The arduino-only envs' -DCONFIG_FREERTOS_WATCHDOG_TIMEOUT_S=120 build flag
+# this once claimed parity with is a dead flag: nothing in src/ or the IDF
+# reads that macro name.)
 #
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=120
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60

@@ -713,6 +713,13 @@
  *              [0x00][0x73] success or [0x00][0x74] timeout.
  *            [0xFF][0x82] if incomplete (a hole remains / byte count short).
  * @errors:   NACK [0xFF][0x82] on incompleteness; refresh via 0x73/0x74.
+ *            Slot-target transfers (LOCAL FORK DIVERGENCE) reuse the same
+ *            2-byte NACK for a STORAGE failure too (temp-file open/write/
+ *            rename failed -- typically filesystem full); the client cannot
+ *            distinguish that from a hole, so treat a slot END NACK that
+ *            repeats on a clean retransmit as persistent (do not retry
+ *            forever). A slot-target success is ACK-only: no 0x73/0x74 ever
+ *            follows (see CMD_PIPE_WRITE_START's slot @state).
  * @state:    client must not send END until every chunk is acked.
  * @limits:   -
  * @targets:  Firmware      (NOT NRF54, NOT Silabs, NOT NRF52811)

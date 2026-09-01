@@ -668,12 +668,27 @@ void processButtonEvents() {
         // the physical layout after on-device testing showed the opposite
         // felt backwards -- swap here, not in the BinaryInputs pin config,
         // if it ever needs flipping again.
-        if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
-            ButtonState* btn = &buttonStates[changedButtonIndex];
-            if (btn->current_state == 1) {
-                if (btn->button_id == 0) odDisplayCycleSlot(-1);        // KEY1
-                else if (btn->button_id == 1) odDisplayCycleSlot(+1);   // KEY2
-                else if (btn->button_id == 2) odDisplayJumpToSlot(0);   // KEY3 (short press)
+        // Act on PRESS-COUNT DELTAS, not a re-read of the pin: the ISR bumps
+        // press_count durably on every press edge, while current_state (and a
+        // digitalRead here) reflect the pin at POLL time -- a press+release
+        // that fits inside one poll interval would read "not pressed" and be
+        // dropped. Irrelevant at the stock 5 ms idle tick, but the PM builds
+        // widen it to 100 ms (main.cpp), which a short press can fit inside.
+        // This is the same durable-count-over-transient-bit design the host's
+        // AdvertisementTracker already uses. Scanning every button (not just
+        // changedButtonIndex) also survives two different buttons coalescing
+        // into the single pending flag. press_count is 4 bits -- 16 presses
+        // inside one poll interval would alias, which no human manages.
+        {
+            static uint8_t lastSlotPressCount[MAX_BUTTONS] = {0};
+            for (uint8_t i = 0; i < MAX_BUTTONS; ++i) {
+                if (!buttonStates[i].initialized) continue;
+                uint8_t pc = buttonStates[i].press_count;
+                if (pc == lastSlotPressCount[i]) continue;
+                lastSlotPressCount[i] = pc;
+                if (buttonStates[i].button_id == 0) odDisplayCycleSlot(-1);        // KEY1
+                else if (buttonStates[i].button_id == 1) odDisplayCycleSlot(+1);   // KEY2
+                else if (buttonStates[i].button_id == 2) odDisplayJumpToSlot(0);   // KEY3 (short press)
             }
         }
     }

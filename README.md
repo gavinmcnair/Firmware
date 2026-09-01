@@ -52,10 +52,12 @@ The `esp32-s3-N16R8-pm` env builds hybrid (`framework = arduino, espidf`, root
 `sdkconfig.defaults`) to enable what the stock precompiled Arduino libraries
 compile out: `CONFIG_PM_ENABLE`, tickless idle, and BLE controller modem
 sleep. `main.cpp` then arms `esp_pm_configure()` (DFS 240/40 MHz + automatic
-light sleep) at the end of setup. The chip sleeps whenever the loop idles
-while the BLE controller keeps advertising / holding connections through it —
-always reachable for a push, at an estimated ~1–3 mA average instead of
-~25–40 mA. This is the battery answer for boards that must accept a BLE push
+light sleep) at the end of setup. While idle/advertising — the dominant state
+— the chip light-sleeps between advertising events and stays fully reachable
+for a push, at an estimated ~1–3 mA average instead of ~25–40 mA. While a
+client is CONNECTED the loop deliberately spins at `delay(1)`, which is below
+the tickless-idle threshold, so connected periods run on DFS alone (~tens of
+mA); they are transient (connect, push, disconnect), so this costs little. This is the battery answer for boards that must accept a BLE push
 at any moment and therefore keep `deep_sleep_time_seconds: 0` (deep sleep
 powers the radio off entirely; no ESP32 can wake on BLE from deep sleep).
 Validated on hardware 2026-09-01: steady ~300 ms advertising while

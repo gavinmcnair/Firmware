@@ -660,13 +660,13 @@ static void slotFilePath(uint8_t slot_index, char* out, size_t out_len) {
 // 4KB LittleFS block of metadata and the reserve keeps the config file
 // (config_parser.cpp shares this filesystem) plus allocator slack out of
 // reach. So a 1.5MB partition (default_8MB.csv) yields ~39 slots and a 3.4MB
-// one (default_16MB.csv) the full 100 -- no per-env budget flag needed.
+// one (default_16MB.csv) 92 -- no per-env budget flag needed.
 // The validity index costs ONE directory walk, deliberately not a per-slot
 // exists() probe: each exists() re-walks the directory, and 100 of those at
 // boot is exactly the kind of boot-time cost FINDINGS.md documents this
 // battery device cannot afford.
 static void slotStoreInit(void) {
-    if (!LittleFS.begin(true)) {   // no-op success if config_parser already mounted it
+    if (!LittleFS.begin(true)) {   // FIRST mount of this FS (setup() runs odDisplayReserveBuffers before full_config_init); config_parser's later begin() is the no-op
         od_log_error("ERROR: slot store: LittleFS mount failed -- slot storage disabled");
         slotCount = 0;
         return;
@@ -679,11 +679,22 @@ static void slotStoreInit(void) {
     if (count > OD_SLOT_MAX_COUNT) count = OD_SLOT_MAX_COUNT;
     slotCount = (uint8_t)count;
     // RTC survivor sanity: a firmware/partition change across a deep sleep can
-    // shrink slotCount below what the RTC copy remembers. An out-of-range
-    // current slot must not wedge the cycle search's wrap arithmetic.
-    if (currentSlotIndex >= OD_SLOT_MAX_COUNT) currentSlotIndex = 0;
+    // shrink slotCount below what the RTC copy remembers. Clamp against the
+    // RUNTIME capacity, not just OD_SLOT_MAX_COUNT: an out-of-range value
+    // can never match odDisplayCycleSlot's wrapped candidate, so its
+    // full-cycle early-exit would silently never fire.
+    if (currentSlotIndex >= slotCount) currentSlotIndex = 0;
     memset(slotValid, 0, sizeof(slotValid));
     if (!LittleFS.exists(SLOT_DIR)) LittleFS.mkdir(SLOT_DIR);
+    {
+        // Reap a stale temp file (crash between slotWriteFile's open and
+        // rename): the scan below skips it by name, but with no reap it
+        // holds up to ~36KB of the capacity arithmetic's headroom until the
+        // next slot write happens to reuse the path.
+        char tmpPath[16];
+        snprintf(tmpPath, sizeof tmpPath, "%s/.tmp", SLOT_DIR);
+        if (LittleFS.exists(tmpPath)) LittleFS.remove(tmpPath);
+    }
     uint32_t found = 0;
     File dir = LittleFS.open(SLOT_DIR);
     if (dir && dir.isDirectory()) {
@@ -693,7 +704,9 @@ static void slotStoreInit(void) {
             char* end = nullptr;
             long id = strtol(name, &end, 10);
             if (end == name || *end != '\0' || id < 0 || id >= (long)slotCount) continue;
-            if (f.size() < sizeof(SlotFileHeader) ||
+            // <= : a header-only file (0 payload bytes) is not a usable slot;
+            // counting it would waste one button press on a doomed switch.
+            if (f.size() <= sizeof(SlotFileHeader) ||
                 f.size() - sizeof(SlotFileHeader) > OD_SLOT_SIZE_BYTES) continue;
             SlotFileHeader hdr;
             if (f.read((uint8_t*)&hdr, sizeof hdr) != sizeof hdr ||
@@ -729,6 +742,17 @@ static bool slotWriteFile(uint8_t slot_index, uint32_t length, uint32_t decompre
     bool ok = f.write((const uint8_t*)&hdr, sizeof hdr) == sizeof hdr &&
               f.write(slotStaging, length) == length;
     f.close();
+    if (ok) {
+        // write() success is not durability: the VFS stream is fully
+        // buffered and a flush error on the LAST partial buffer surfaces at
+        // fclose -- whose status File::close() (void) discards. An
+        // ENOSPC-truncated tail would otherwise get atomically renamed into
+        // place as a "valid" short file. Re-stat the temp file and require
+        // the exact byte count before letting the rename happen.
+        File chk = LittleFS.open(tmpPath, FILE_READ);
+        ok = chk && chk.size() == sizeof hdr + length;
+        if (chk) chk.close();
+    }
     if (ok) ok = LittleFS.rename(tmpPath, path);
     if (!ok) {
         od_log_error("ERROR: slot %u: file write failed (%u B; FS full?)",
@@ -891,9 +915,21 @@ void checkTransferTimeouts(void) {
     // (pipeState.to_slot) is a THIRD legitimate case with no hardware half at
     // all, by design -- it assembles into the PSRAM staging buffer, touches
     // flash only at END, and never touches the panel (see
-    // handlePipeWriteStart's slot-target branch). It has no panel power
-    // or watchdog-worthy resource to leak if abandoned mid-transfer (unlike
-    // direct-write/partial), so it doesn't need its own timeout here either --
+    // handlePipeWriteStart's slot-target branch). It leaks no panel power if
+    // abandoned, but it DOES hold transferActive() true, which silently
+    // refuses every button press and CMD_SLOT_SWITCH -- so it gets the same
+    // 15-min watchdog as the other transfer types (below), bounding that
+    // lockout even against a client that stays connected and chatty (the
+    // 120s idle timeout only covers a client that goes quiet).
+    if (pipeState.active && !pipeState.error && pipeState.to_slot &&
+        (millis() - pipeState.start_ms) > TRANSFER_WATCHDOG_MS) {
+        od_log_error("ERROR: slot-target transfer watchdog (%u ms) - resetting",
+                     (unsigned)(millis() - pipeState.start_ms));
+        resetPipeWriteState();   // staging only -- no panel/link teardown needed
+        return;
+    }
+    // The orphan check below still exempts to_slot: a live slot session
+    // legitimately has no hardware half, and the watchdog above now bounds it --
     // a stuck one self-heals on the next 0x0080 START, which unconditionally
     // resets pipeState regardless of session type.
     if (pipeState.active && !pipeState.error && !directWriteActive && !partialCtx.active && !pipeState.to_slot) {
@@ -2797,6 +2833,13 @@ bool odDisplaySwitchToSlot(uint8_t slot_index) {
     // one push with final=true, unlike the multi-call BLE-streaming case.
     if (!zlib_stream_to_direct_write(slotStaging, length, true)) {
         cleanupDirectWriteState(true);   // fatal teardown, same as a BLE decode failure
+        // Drop the slot from the rotation, same as the missing-file case
+        // above: the bytes are corrupt AT REST, so every retry would repeat
+        // this whole panel bring-up + failed decode -- on battery, a button
+        // held near a poisoned slot would burn power indefinitely. A fresh
+        // push to this slot re-validates it.
+        od_log_error("ERROR: slot %u decode failed -- dropping from index", (unsigned)slot_index);
+        slotValid[slot_index] = false;
         return false;
     }
 
@@ -3281,6 +3324,7 @@ void handlePipeWriteStart(uint8_t* data, uint16_t len) {
 
     pipeState.active = true;
     pipeState.error = false;
+    pipeState.start_ms = millis();
     pipeState.compressed = compressed;
     pipeState.gap_open = false;
     pipeState.window = w_eff;
